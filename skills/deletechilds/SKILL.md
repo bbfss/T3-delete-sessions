@@ -1,13 +1,13 @@
 ---
 name: deletechilds
-description: 显式 /deletechilds 清理当前会话的全部已核实后代，先核验所有远端删除成功再清本地，当前会话保留。支持T3跨环境委派树。
+description: 显式 /deletechilds 或 $deletechilds 清理当前会话的全部已核实后代，先核验所有远端删除成功再清本地，当前会话保留。支持T3跨环境委派树。
 ---
 
 # 删除会话后代
 
-只有用户实际发送 `/deletechilds` 或对应 Skill 才执行。讨论、引用、自动登记不授权删除。不再调用旧的 `t3-clean-sessions --current`。
+只有用户实际发送 `/deletechilds`、`$deletechilds`（T3 斜杠菜单选择 Skill 后自动插入 `$deletechilds`）或对应 Skill 才执行。讨论、引用、自动登记不授权删除。不再调用旧的 `t3-clean-sessions --current`。
 
-使用 T3-delete-sessions 1.5.0+（纯 Node.js 零外部依赖）。若 MCP 尚未刷新，可在目标机器以单次工具模式调用：
+使用 T3-delete-sessions 1.6.0+（纯 Node.js 零外部依赖）。若 MCP 尚未刷新或宿主未挂载外部 MCP，可在目标机器以单次工具模式调用：
 
 ```sh
 npx -y github:bbfss/T3-delete-sessions --auto-local --call inspect_target --arguments-file request.json

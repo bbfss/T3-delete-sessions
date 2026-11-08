@@ -27,6 +27,7 @@ inspection only. Reconnect the MCP after upgrading to load the new tools.
 - `inspect_target`: returns hostname, resolved database path and write mode.
 - `delete_subsessions`: selects descendants of an explicit thread ID, preserving the parent.
 - `delete_family`: selects descendants; includes the parent only with `keep_parent: false`.
+- `schedule_delete_family`: spawns an OS-detached background worker (`Win32_Process.Create` on Windows, detached `setsid` + `SIGHUP` ignore on macOS/Linux) that waits `delay_ms` (default `1500ms`) and executes online `delete_family(..., keep_parent: false)`, writing a verified external JSON receipt so `/deletefamily` (`$deletefamily`) finishes in seconds without killing its own MCP call mid-flight.
 - `delete_orphans`: selects orphan roots and their descendants; `archive_only: true` archives them.
 
 All cleanup tools default to `dry_run: true`. Supply `target_host` and `db_path`
@@ -143,20 +144,58 @@ planning/execution. Only Node.js (`>= 22.12`) and the local T3 CLI are required 
 Existing T3 links and authorization are required for delegated workers. The
 current thread stays available to collect outcomes and retry blocked branches.
 
-### Slash command scope
+### Slash & `$` skill command scope
 
-`/deletechilds` preserves the invoking thread.
-`/deletefamily` includes the invoking thread as the final target, after all remote
-and local descendants have been verified deleted. Deleting the invoking thread
-requires an independent final executor because T3 stops that thread's agent and
-tools. This final self-deletion handoff has not been integration-tested; a missing
-executor is reported as a blocked final step, not as a successful family deletion.
+Both `/command` and `$command` triggers are supported (selecting a skill from T3 Code's `/` composer menu inserts `$<skill-name>` such as `$deletefamily`):
 
-`/deletefathers` preserves the invoking thread and all of its descendants, and
-removes every ancestor and the other branches of that same family. It calls
-`plan_cross_device_cleanup` with `scope: "preserve_current_subtree"`; the protected
-subtree is excluded from dependencies and deletion targets. Missing ancestors
-block planning. Protected side chats that T3 would cascade-delete block execution.
-Surviving threads retain their historical lineage metadata; this does not rewrite
-the T3 database to reparent them. `/deletesessions` and `/deletesubsessions` are
-removed slash commands, not aliases. MCP tool names remain stable.
+- `/deletechilds` (`$deletechilds`): preserves the invoking thread and deletes verified descendants.
+- `/deletefamily` (`$deletefamily`): includes the invoking thread as the final target. For single-environment sessions without remote descendants, `schedule_delete_family` completes the detached self-deletion handoff in seconds and writes a verified receipt under `~/.local/state/session-family-cleanup/self-delete/` (or `%LOCALAPPDATA%\session-family-cleanup\self-delete\` on Windows). When remote descendants exist, all remote steps must succeed before local/root deletion.
+- `/deletefathers` (`$deletefathers`): preserves the invoking thread and all of its descendants, and removes every ancestor and the other branches of that same family (`scope: "preserve_current_subtree"`).
+- `/deleteorphans` (`$deleteorphans`): previews and cleans verified local orphan trees.
+
+`/deletesessions` and `/deletesubsessions` are removed slash commands, not aliases. MCP tool names remain stable.
+
+## T3 Code + Antigravity (`GEMINI_HOME` Isolation & Magpie Sync)
+
+Unlike Codex (`~/.codex`) and Claude (`~/.claude`), **T3 Code intentionally isolates Antigravity into a per-instance `GEMINI_HOME` directory**:
+
+- Default instance path: `~/.t3/userdata/providers/antigravity/ac0a3dfd6dddb20962cecff6ee5fe65e19d3923be20e52c5ab52ff877f7e4c32/` (`SHA-256("antigravity")`; on Windows under `%USERPROFILE%\.t3\userdata\providers\antigravity\...`).
+- **Why T3 isolates `GEMINI_HOME`**:
+  1. Allows multiple Antigravity provider instances/accounts in T3 without overwriting `~/.gemini` login state;
+  2. Forces headless file-based OAuth storage (`AGY_ACP_FORCE_FILE_STORAGE=1`) and intercepts browser auth URLs for remote/daemon T3 hosts;
+  3. Strips conflicting host environment variables (`GEMINI_API_KEY`, `GOOGLE_API_KEY`, `GOOGLE_CLOUD_PROJECT`, etc.);
+  4. Leaves `<isolated-dir>/config/mcp_config.json` and `GEMINI.md` unlinked by default so lightweight internal helper calls do not spawn external MCP servers.
+
+If you manage shared instructions, skills, and MCP servers with **Magpie** (which syncs `agy` to `~/.gemini/config/`), three separate adjustments are needed so T3 Antigravity sessions recognize both MCP tools and `$skill` / `/skill` commands:
+
+1. **Switch Magpie `agy` skills from `link` to `copy`** (fixes Antigravity `view_file` symlink sandbox `Access denied` when `realpath` points into `~/.config/magpie/library/skills`):
+   ```sh
+   # On headless Linux/VPS without standalone Antigravity CLI, create the marker file first so Magpie detects `agy`:
+   mkdir -p ~/.gemini/antigravity-cli && [ -f ~/.gemini/antigravity-cli/settings.json ] || echo '{}' > ~/.gemini/antigravity-cli/settings.json
+
+   magpie library skill how copy agy
+   magpie library sync
+   ```
+2. **Link `skills`, `GEMINI.md` (shared instructions), and `mcp_config.json` into T3's isolated Antigravity profile**:
+   - **macOS / Linux**:
+     ```sh
+     AGY_T3_CFG="$HOME/.t3/userdata/providers/antigravity/ac0a3dfd6dddb20962cecff6ee5fe65e19d3923be20e52c5ab52ff877f7e4c32/config"
+     mkdir -p "$AGY_T3_CFG"
+     ln -sfn "$HOME/.gemini/config/skills" "$AGY_T3_CFG/skills"
+     ln -sfn "$HOME/.gemini/config/GEMINI.md" "$AGY_T3_CFG/GEMINI.md"
+     ln -sfn "$HOME/.gemini/config/mcp_config.json" "$AGY_T3_CFG/mcp_config.json"
+     ```
+   - **Windows (PowerShell)**:
+     ```powershell
+     $cfg = "$env:USERPROFILE\.t3\userdata\providers\antigravity\ac0a3dfd6dddb20962cecff6ee5fe65e19d3923be20e52c5ab52ff877f7e4c32\config"
+     New-Item -ItemType Directory -Force -Path $cfg | Out-Null
+     if (-not (Test-Path "$cfg\skills")) {
+       New-Item -ItemType Junction -Path "$cfg\skills" -Target "$env:USERPROFILE\.gemini\config\skills" | Out-Null
+     }
+     cmd /c mklink "$cfg\GEMINI.md" "$env:USERPROFILE\.gemini\config\GEMINI.md"
+     cmd /c mklink "$cfg\mcp_config.json" "$env:USERPROFILE\.gemini\config\mcp_config.json"
+     ```
+   *(Note: On Windows without Developer Mode / Administrator file-symlink privileges, `New-Item -ItemType HardLink` can be used for `GEMINI.md` and `mcp_config.json`, or leave `mcp_config.json` unlinked so skills invoke `npx -y github:bbfss/T3-delete-sessions --auto-local --call ...` directly. In T3 `0.1.7`, linking a non-empty `mcp_config.json` sets `supportsTextGeneration: false` on the Antigravity provider so T3 falls back to Codex/Claude for background thread-title generation while normal Antigravity chat sessions load all Magpie MCP servers.)*
+3. **Ensure `$<skill-name>` is recognized alongside `/<skill-name>`**:
+   Selecting a skill from T3 Code's `/` menu inserts `$<skill-name>` (Codex syntax). Codex auto-expands `$<skill-name>`, whereas Antigravity passes the literal text `$<skill-name>` to the model. Keep `$<skill-name>` in skill descriptions (included in `skills/*/SKILL.md` in `1.6.0+`) and in shared `GEMINI.md` instructions so Antigravity immediately loads the matching `SKILL.md`.
+

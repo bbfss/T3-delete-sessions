@@ -1,11 +1,11 @@
 ---
 name: deletefathers
-description: 显式 /deletefathers 在整棵family中只保留当前节点为root的子树，删除全部祖先及其余分支；跨设备先远端成功再本地。
+description: 显式 /deletefathers 或 $deletefathers 在整棵family中只保留当前节点为root的子树，删除全部祖先及其余分支；跨设备先远端成功再本地。
 ---
 
 # 只保留当前子树
 
-只有用户实际发送 `/deletefathers` 或直接选择本 Skill 才授权执行。目标范围是**最高祖先所辖的整棵family，减去当前节点及其全部后代**。包括所有祖先、兄弟/叔伯等其他分支及它们的后代。不相关的family保持不动。当前节点已经是根时没有删除目标。
+只有用户实际发送 `/deletefathers`、`$deletefathers` 或直接选择本 Skill 才授权执行。目标范围是**最高祖先所辖的整棵family，减去当前节点及其全部后代**。包括所有祖先、兄弟/叔伯等其他分支及它们的后代。不相关的family保持不动。当前节点已经是根时没有删除目标。
 
 1. 复用 [deletechilds](../deletechilds/SKILL.md) 的身份核实、跨设备执行及回执机制，但本命令必须使用下面的范围。不得执行deletechilds的默认后代删除计划。
 2. 从当前节点向上核实直到最高祖先，并核实该family的所有分支；任何祖先缺失或跨设备归属未明时停止补查，不把缺失节点当作根。全部关系用真实environmentId/threadId和parentNodeId登记。

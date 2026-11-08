@@ -5,10 +5,15 @@ import readline from "node:readline";
 import { resolveT3Cli } from "../bin/platform.js";
 import { cleanFamily, cleanOrphans } from "./cleaner.js";
 import { executeStep, planCleanup } from "./family.js";
+import {
+  defaultCleanupStateDir,
+  runDetachedWorker,
+  spawnDetachedSelfDelete,
+} from "./self-delete.js";
 import { normalizeDbPath, sameDbPath, withDatabase } from "./sqlite.js";
 import { dispatchT3Commands } from "./ws-rpc.js";
 
-export const SERVER_VERSION = "1.5.0";
+export const SERVER_VERSION = "1.6.0";
 
 export function toolDefinitions() {
   const common = {
@@ -68,6 +73,29 @@ export function toolDefinitions() {
     });
   }
 
+  result.push({
+    name: "schedule_delete_family",
+    description:
+      "Fast detached self-deletion for /deletefamily ($deletefamily). Previews by default; when dry_run=false on a running T3 server, spawns an independent OS-detached worker that waits delay_ms and deletes local descendants plus thread_id (keep_parent=false), writing a verified JSON receipt outside the session.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        target_host: common.target_host,
+        db_path: common.db_path,
+        thread_id: { type: "string", minLength: 1 },
+        delay_ms: {
+          type: "integer",
+          minimum: 200,
+          maximum: 30000,
+          default: 1500,
+        },
+        dry_run: { type: "boolean", default: true },
+      },
+      required: ["target_host", "db_path", "thread_id"],
+      additionalProperties: false,
+    },
+  });
+
   result.push(
     {
       name: "plan_cross_device_cleanup",
@@ -119,7 +147,7 @@ export async function callTool(
   name,
   args = {},
   config = {},
-  { dispatchFn = dispatchT3Commands } = {}
+  { dispatchFn = dispatchT3Commands, spawnSelfDeleteFn = spawnDetachedSelfDelete } = {}
 ) {
   if (name === "plan_cross_device_cleanup") {
     return planCleanup(
@@ -202,6 +230,11 @@ export async function callTool(
     if (schema.properties[key].type === "boolean" && typeof value !== "boolean") {
       throw new Error(`${key} must be a boolean`);
     }
+    if (schema.properties[key].type === "integer") {
+      if (!Number.isInteger(value) || value < 200 || value > 30000) {
+        throw new Error(`${key} must be an integer between 200 and 30000`);
+      }
+    }
   }
 
   if (!dbConfigPath) {
@@ -220,6 +253,44 @@ export async function callTool(
   }
 
   const dryRun = args.dry_run === undefined ? true : args.dry_run;
+  if (name === "schedule_delete_family") {
+    if (!t3Url) {
+      throw new Error(
+        "schedule_delete_family requires a running online T3 server (--t3-url or --auto-local)"
+      );
+    }
+    const preview = cleanFamily(args.thread_id, dbConfigPath, {
+      dryRun: true,
+      keepParent: false,
+      action: "delete",
+    });
+    if (!preview.parentSelected) {
+      throw new Error(`Thread ${args.thread_id} was not found or is already deleted`);
+    }
+    const delayMs = args.delay_ms ?? 1500;
+    if (dryRun) {
+      return {
+        target,
+        ...preview,
+        delay_ms: delayMs,
+        receipt_dir: join(defaultCleanupStateDir(), "self-delete"),
+      };
+    }
+    const scheduled = spawnSelfDeleteFn({
+      target_host: args.target_host,
+      db_path: dbConfigPath,
+      thread_id: args.thread_id,
+      delay_ms: delayMs,
+      config: { db: dbConfigPath, t3Url, t3Cli },
+    });
+    return {
+      target,
+      ...preview,
+      status: "scheduled_detached_delete",
+      ...scheduled,
+    };
+  }
+
   if (
     !dryRun &&
     !t3Url &&
@@ -393,6 +464,7 @@ export function parseCliArgs(argv, { env = process.env, homedir = os.homedir() }
     autoLocal: false,
     call: null,
     argumentsFile: null,
+    detachedWorker: null,
     help: false,
   };
 
@@ -411,7 +483,8 @@ export function parseCliArgs(argv, { env = process.env, homedir = os.homedir() }
       arg === "--t3-url" ||
       arg === "--t3-cli" ||
       arg === "--call" ||
-      arg === "--arguments-file"
+      arg === "--arguments-file" ||
+      arg === "--detached-worker"
     ) {
       if (i + 1 >= argv.length) {
         throw new Error(`Argument ${arg} expected one value`);
@@ -423,6 +496,7 @@ export function parseCliArgs(argv, { env = process.env, homedir = os.homedir() }
       else if (arg === "--t3-cli") config.t3Cli = val;
       else if (arg === "--call") config.call = val;
       else if (arg === "--arguments-file") config.argumentsFile = val;
+      else if (arg === "--detached-worker") config.detachedWorker = val;
     } else {
       throw new Error(`Unknown argument: ${arg}`);
     }
@@ -466,6 +540,17 @@ export async function runMain(argv = process.argv.slice(2)) {
 
   if (config.help) {
     process.stdout.write(HELP_TEXT);
+    return;
+  }
+
+  if (config.detachedWorker) {
+    try {
+      await runDetachedWorker(config.detachedWorker, (args, jobConfig) =>
+        callTool("delete_family", args, jobConfig)
+      );
+    } catch {
+      process.exit(1);
+    }
     return;
   }
 
