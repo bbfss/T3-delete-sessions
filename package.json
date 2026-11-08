@@ -1,6 +1,6 @@
 {
   "name": "t3-delete-sessions",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "T3 Code Session Cascading Cleaner & Orphan Purger MCP Server",
   "type": "module",
   "bin": {
@@ -14,7 +14,8 @@
     "README.md"
   ],
   "scripts": {
-    "start": "node ./bin/cli.js"
+    "start": "node ./bin/cli.js",
+    "test": "python3 -m unittest discover -s tests -v"
   },
   "repository": {
     "type": "git",

@@ -1,63 +1,76 @@
-# T3-delete-sessions (MCP & CLI)
+# T3-delete-sessions
 
-A comprehensive, deterministic session cascading cleaner and orphan purger for **T3 Code**.
+MCP tools to inspect T3 session families and maintain an **offline database**.
+Requires Node.js and Python 3 with SQLite support.
 
-## Features
-
-- **Cascade Delete (`delete_family`)**: Deletes a parent session along with all of its child subagents and delegated sessions bottom-up (post-order traversal). Prevents child sessions from popping up in the sidebar.
-- **Orphan Purger (`delete_orphans`)**: Scans the entire T3 database for sessions whose parent session was deleted, and purges or archives them in bulk.
-- **Subagent Cleaner (`delete_subsessions`)**: Cleans up all subagent tasks under the current session while preserving the current session for continuous work.
-- **Multi-layer Cleanup**:
-  - Updates `orchestration_v2_projection_threads`
-  - Appends official Event Sourcing domain events (`orchestration_events`)
-  - Cleans up underlying provider sessions (Codex, Antigravity, etc.)
-  - Safely purges temporary scratch worktrees in `~/.t3/scratch/`
-
----
-
-## Quick Setup via NPX (Zero Install)
-
-You can run this MCP directly with `npx` without cloning or installing dependencies.
-
-Add this to your MCP configuration (e.g., T3 Code, Claude Desktop, Cursor):
+## Setup
 
 ```json
 {
   "mcpServers": {
     "t3-delete-sessions": {
       "command": "npx",
-      "args": ["-y", "github:bbfss/T3-delete-sessions"]
+      "args": ["-y", "github:bbfss/T3-delete-sessions", "--db", "/absolute/path/to/offline-statev2.sqlite"]
     }
   }
 }
 ```
 
-*(Once published to the npm registry, you can also use `["-y", "t3-delete-sessions"]`)*
+The MCP process operates on the machine that starts it. A local `npx` process
+stays local even when an agent also runs tasks in InstaBox. To inspect an
+InstaBox database, start the process inside that sandbox with its database path.
+No database is selected automatically. Starting without `--db` permits target
+inspection only. Reconnect the MCP after upgrading to load the new tools.
 
----
+## Tools
 
-## Exposed MCP Tools
+- `inspect_target`: returns hostname, resolved database path and write mode.
+- `delete_subsessions`: selects descendants of an explicit thread ID, preserving the parent.
+- `delete_family`: selects descendants; includes the parent only with `keep_parent: false`.
+- `delete_orphans`: selects orphan roots and their descendants; `archive_only: true` archives them.
 
-1. **`delete_orphans`**: Scan and purge all orphan sessions in T3 (sessions whose parent session was deleted).
-2. **`delete_family`**: Cascade delete a target session and all of its descendants bottom-up (连根拔起).
-3. **`delete_subsessions`**: Clean only child subagents, keeping the parent session active for further chat.
+All cleanup tools default to `dry_run: true`. Supply `target_host` and `db_path`
+exactly as returned by `inspect_target`, plus `thread_id` for family operations.
+IDs are never inferred from the working directory, title or latest activity.
 
----
+Example preview:
 
-## Local Development & CLI Usage
-
-You can also run the cleaner script directly from the terminal:
-
-```bash
-# Scan and clean all orphan sessions
-python3 cleaner.py --orphans
-
-# Cascade delete a specific session and all its child tasks
-python3 cleaner.py --thread <THREAD_ID>
-
-# Clean all child subagents under the current session (keep parent)
-python3 cleaner.py --current --keep-parent
+```json
+{
+  "target_host": "sandbox-hostname",
+  "db_path": "/tmp/test-statev2.sqlite",
+  "thread_id": "test-parent",
+  "dry_run": true
+}
 ```
+
+## Offline writes
+
+For a disposable snapshot, or a database whose owning T3 server has been stopped,
+start with `--allow-offline-writes`, then pass `dry_run: false` and
+`offline_confirmed: true`. The caller must establish that the database is offline;
+the flag does not detect or stop T3. Use T3's official interface for live sessions.
+
+Updates mark the selected projection rows and append local database event records
+in one transaction. This is **not an official T3 API call**, does not broadcast to
+a live UI, does not stop agents and does not physically erase conversation data.
+Provider-native sessions, artifacts, scratch directories and worktrees are preserved.
+A preview reports `parentDeleted: false`; successful writes report
+`updated_offline_database`, not physical deletion.
+
+The SQL targets the schema exercised in `tests/test_cleaner.py`; compatibility
+with arbitrary T3 releases, side-chat relationships and cross-device families is
+not established. Descendants use lineage, delegatedFrom and subagent records.
+The tools do not patch the T3 UI delete button or clean remote machines implicitly.
+
+## Development
+
+```sh
+npm test
+python3 server.py --help
+```
+
+Tests use temporary synthetic databases and never open the user's T3 database.
 
 ## License
 
