@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""MCP interface for inspecting and maintaining an offline T3 database."""
+"""MCP session cleanup through a running T3 server or an offline database."""
 import argparse
 import json
 import socket
 import sys
+import subprocess
+import sqlite3
 from pathlib import Path
 from cleaner import clean_family, clean_orphans
 
@@ -28,7 +30,7 @@ def tool_definitions():
             properties["keep_parent"] = {"type": "boolean", "default": True}
         if name == "delete_orphans":
             properties["archive_only"] = {"type": "boolean", "default": False}
-        result.append({"name": name, "description": "Preview by default. Explicit offline database maintenance only; preserves native provider files and worktrees. No live UI broadcast.",
+        result.append({"name": name, "description": "Preview by default. In online mode, stop and clean selected threads through T3 official commands. Offline mode requires explicit opt-in. Preserves provider files and worktrees.",
                        "inputSchema": {"type": "object", "properties": properties, "required": required,
                                        "additionalProperties": False}})
     return result
@@ -37,6 +39,7 @@ def tool_definitions():
 def call_tool(name, args, config):
     target = {"hostname": socket.gethostname(), "db_path": str(config.db) if config.db else None,
               "offline_writes_enabled": config.allow_offline_writes,
+              "t3_url": getattr(config, "t3_url", None),
               "native_files": "preserved", "worktrees": "preserved"}
     if name == "inspect_target":
         return target
@@ -58,13 +61,39 @@ def call_tool(name, args, config):
     if args["target_host"] != target["hostname"] or not supplied_path.is_absolute() or supplied_path.resolve() != config.db:
         raise ValueError("Target mismatch: call inspect_target on the intended machine first")
     dry_run = args.get("dry_run", True)
-    if not dry_run and not (config.allow_offline_writes and args.get("offline_confirmed") is True):
+    if not dry_run and not getattr(config, "t3_url", None) and not (config.allow_offline_writes and args.get("offline_confirmed") is True):
         raise ValueError("Writes require --allow-offline-writes and offline_confirmed=true. Use the official T3 API for a running server.")
     if name == "delete_orphans":
-        result = clean_orphans(config.db, dry_run=dry_run, action="archive" if args.get("archive_only") else "delete")
+        result = clean_orphans(config.db, dry_run=True if getattr(config, "t3_url", None) else dry_run, action="archive" if args.get("archive_only") else "delete")
     else:
-        result = clean_family(args["thread_id"], config.db, dry_run=dry_run,
+        result = clean_family(args["thread_id"], config.db, dry_run=True if getattr(config, "t3_url", None) else dry_run,
                               keep_parent=True if name == "delete_subsessions" else args.get("keep_parent", True))
+    if getattr(config, "t3_url", None) and not dry_run:
+        ids = [r["threadId"] for r in result.get("orphans", result.get("children", []))]
+        if result.get("parentSelected"):
+            ids.append(args["thread_id"])
+        action = "archive" if args.get("archive_only") else "delete"
+        commands = []
+        for tid in ids:
+            commands.extend([{"type": "thread.stop", "threadId": tid},
+                             {"type": "thread." + action, "threadId": tid}])
+        if commands:
+            proc = subprocess.run(["node", str(Path(__file__).parent / "bin/t3-rpc.js")],
+                input=json.dumps({"cli": config.t3_cli, "baseDir": str(config.db.parent.parent),
+                                  "url": config.t3_url, "commands": commands}),
+                text=True, capture_output=True, timeout=40)
+            if proc.returncode:
+                raise RuntimeError("T3 command failed; some earlier commands may have completed: " + proc.stderr[-1500:])
+            with sqlite3.connect(config.db.resolve().as_uri() + "?mode=ro", uri=True) as conn:
+                for tid in ids:
+                    row = conn.execute("SELECT " + ("archived_at" if action == "archive" else "deleted_at") +
+                                       " FROM orchestration_v2_projection_threads WHERE thread_id=?", (tid,)).fetchone()
+                    if row is None or row[0] is None:
+                        raise RuntimeError("T3 did not confirm the requested state for " + tid)
+        result["status"] = "completed_via_t3"
+        result["parentDeleted"] = bool(result.get("parentSelected")) and action == "delete"
+        for item in result.get("orphans", result.get("children", [])):
+            item.pop("dryRun", None)
     return {"target": target, **result}
 
 
@@ -77,7 +106,7 @@ def handle_rpc(config):
             method = req.get("method")
             if method == "initialize":
                 result = {"protocolVersion": "2024-11-05", "capabilities": {"tools": {}},
-                          "serverInfo": {"name": "t3-delete-sessions-mcp", "version": "1.1.0"}}
+                          "serverInfo": {"name": "t3-delete-sessions-mcp", "version": "1.2.0"}}
             elif method == "tools/list":
                 result = {"tools": tool_definitions()}
             elif method == "ping":
@@ -99,8 +128,10 @@ def handle_rpc(config):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--db", type=Path, help="Explicit absolute path; no default production database")
+    parser.add_argument("--db", type=Path, help="Explicit absolute path to the target T3 database")
     parser.add_argument("--allow-offline-writes", action="store_true")
+    parser.add_argument("--t3-url", help="Running T3 URL for official online deletion")
+    parser.add_argument("--t3-cli", default="t3", help="T3 CLI on this machine")
     config = parser.parse_args()
     if config.db:
         if not config.db.is_absolute():

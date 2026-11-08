@@ -34,3 +34,23 @@ not by a real provider-created agent family. Provider model generation,
 native history deletion, live UI event delivery and the T3 sidebar delete
 button were not verified. This validates offline compatibility with the
 tested T3 schema, not an official live deletion integration.
+
+## Online integration, version 1.2.0
+
+A running T3 0.1.7 server created a parent through its CLI. Two official
+`delegated_task.request` commands created a child and then a grandchild.
+No SQL inserts or fabricated lineage were used. Provider model generation
+was not exercised; the test required T3's real delegation records and lifecycle.
+
+Through the plugin MCP entry point with `--t3-url` and offline writes disabled:
+
+- Descendants-only cleanup deleted both child and grandchild while retaining the parent.
+- A subsequent explicit parent deletion succeeded.
+- An unrelated thread and the course/scratch sentinel files were retained.
+- All writes used official `thread.stop` and `thread.delete` commands against
+  the running server; projected states were checked after completion.
+
+The result is retained at
+`/data/t3-cleaner-real-test-20261108/online-test-report.json` in the sandbox.
+The test server was stopped after completion. This extends the earlier offline
+single-thread test with a real three-level T3 delegation family.
