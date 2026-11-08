@@ -44,18 +44,21 @@ export function spawnDetachedSelfDelete(
     spawnSyncFn = spawnSync,
   } = {}
 ) {
+  const action = payload.action === "archive" ? "archive" : "delete";
   const hash = createHash("sha256")
     .update(String(payload.thread_id))
     .digest("hex")
     .slice(0, 12);
   const stamp = Date.now();
-  const dir = join(stateBaseDir, "self-delete");
+  const subDir = action === "archive" ? "self-archive" : "self-delete";
+  const dir = join(stateBaseDir, subDir);
   const receiptPath = join(dir, `receipt-${hash}-${stamp}.json`);
   const jobPath = join(dir, `job-${hash}-${stamp}.json`);
 
   const delayMs = payload.delay_ms ?? 1500;
   const initialReceipt = {
     status: "scheduled",
+    action,
     scheduledAt: new Date(stamp).toISOString(),
     delayMs,
     target_host: payload.target_host,
@@ -66,6 +69,7 @@ export function spawnDetachedSelfDelete(
   writeJsonAtomic(receiptPath, initialReceipt);
   writeJsonAtomic(jobPath, {
     ...payload,
+    action,
     delay_ms: delayMs,
     receipt_path: receiptPath,
   });
@@ -120,6 +124,7 @@ export function spawnDetachedSelfDelete(
   });
 
   return {
+    action,
     receipt_path: receiptPath,
     job_path: jobPath,
     pid,
@@ -130,7 +135,7 @@ export function spawnDetachedSelfDelete(
 
 export async function runDetachedWorker(
   jobPath,
-  executeDeleteFn,
+  executeFn,
   { sleepFn = (ms) => new Promise((resolve) => setTimeout(resolve, ms)) } = {}
 ) {
   try {
@@ -140,13 +145,14 @@ export async function runDetachedWorker(
   }
 
   const job = JSON.parse(readFileSync(jobPath, "utf8"));
+  const action = job.action === "archive" ? "archive" : "delete";
   const delayMs = Math.max(0, Number(job.delay_ms ?? 1500));
   if (delayMs > 0) {
     await sleepFn(delayMs);
   }
 
   try {
-    const result = await executeDeleteFn(
+    const result = await executeFn(
       {
         target_host: job.target_host,
         db_path: job.db_path,
@@ -154,14 +160,20 @@ export async function runDetachedWorker(
         keep_parent: false,
         dry_run: false,
       },
-      job.config
+      job.config,
+      action
     );
     const receipt = {
       status: result.status ?? "completed_via_t3",
+      action,
       completedAt: new Date().toISOString(),
       thread_id: job.thread_id,
       parentDeleted: Boolean(result.parentDeleted),
-      childrenDeleted: Array.isArray(result.children) ? result.children.length : 0,
+      parentArchived: Boolean(result.parentArchived),
+      childrenDeleted:
+        action === "delete" && Array.isArray(result.children) ? result.children.length : 0,
+      childrenArchived:
+        action === "archive" && Array.isArray(result.children) ? result.children.length : 0,
       result,
     };
     writeJsonAtomic(job.receipt_path, receipt);
@@ -169,6 +181,7 @@ export async function runDetachedWorker(
   } catch (err) {
     const failure = {
       status: "failed",
+      action,
       failedAt: new Date().toISOString(),
       thread_id: job.thread_id,
       reason: String(err?.message || err),

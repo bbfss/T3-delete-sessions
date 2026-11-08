@@ -13,7 +13,7 @@ import {
 import { normalizeDbPath, sameDbPath, withDatabase } from "./sqlite.js";
 import { dispatchT3Commands } from "./ws-rpc.js";
 
-export const SERVER_VERSION = "1.6.0";
+export const SERVER_VERSION = "1.7.0";
 
 export function toolDefinitions() {
   const common = {
@@ -47,23 +47,34 @@ export function toolDefinitions() {
     },
   ];
 
-  for (const name of ["delete_family", "delete_subsessions", "delete_orphans"]) {
+  for (const name of [
+    "delete_family",
+    "delete_subsessions",
+    "delete_orphans",
+    "archive_family",
+    "archive_subsessions",
+    "archive_orphans",
+  ]) {
+    const isOrphans = name.endsWith("_orphans");
+    const isFamily = name.endsWith("_family");
+    const isArchiveTool = name.startsWith("archive_");
     const properties = { ...common };
     const required = ["target_host", "db_path"];
-    if (name !== "delete_orphans") {
+    if (!isOrphans) {
       properties.thread_id = { type: "string", minLength: 1 };
       required.push("thread_id");
     }
-    if (name === "delete_family") {
+    if (isFamily) {
       properties.keep_parent = { type: "boolean", default: true };
     }
-    if (name === "delete_orphans") {
+    if (!isArchiveTool) {
       properties.archive_only = { type: "boolean", default: false };
     }
     result.push({
       name,
-      description:
-        "Preview by default. In online mode, stop and clean selected threads through T3 official commands. Offline mode requires explicit opt-in. Preserves provider files and worktrees.",
+      description: isArchiveTool
+        ? "Preview by default. In online mode, stop and archive selected threads (recoverable) through T3 official commands. Offline mode requires explicit opt-in."
+        : "Preview by default. In online mode, stop and clean selected threads through T3 official commands. Offline mode requires explicit opt-in. Preserves provider files and worktrees.",
       inputSchema: {
         type: "object",
         properties,
@@ -73,34 +84,38 @@ export function toolDefinitions() {
     });
   }
 
-  result.push({
-    name: "schedule_delete_family",
-    description:
-      "Fast detached self-deletion for /deletefamily ($deletefamily). Previews by default; when dry_run=false on a running T3 server, spawns an independent OS-detached worker that waits delay_ms and deletes local descendants plus thread_id (keep_parent=false), writing a verified JSON receipt outside the session.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        target_host: common.target_host,
-        db_path: common.db_path,
-        thread_id: { type: "string", minLength: 1 },
-        delay_ms: {
-          type: "integer",
-          minimum: 200,
-          maximum: 30000,
-          default: 1500,
+  for (const [schedName, schedAction, cmdLabel] of [
+    ["schedule_delete_family", "delete", "/deletefamily ($deletefamily)"],
+    ["schedule_archive_family", "archive", "/archivefamily ($archivefamily)"],
+  ]) {
+    result.push({
+      name: schedName,
+      description: `Fast detached self-${schedAction} for ${cmdLabel}. Previews by default; when dry_run=false on a running T3 server, spawns an independent OS-detached worker that waits delay_ms and ${schedAction}s local descendants plus thread_id (keep_parent=false), writing a verified JSON receipt outside the session.`,
+      inputSchema: {
+        type: "object",
+        properties: {
+          target_host: common.target_host,
+          db_path: common.db_path,
+          thread_id: { type: "string", minLength: 1 },
+          delay_ms: {
+            type: "integer",
+            minimum: 200,
+            maximum: 30000,
+            default: 1500,
+          },
+          dry_run: { type: "boolean", default: true },
         },
-        dry_run: { type: "boolean", default: true },
+        required: ["target_host", "db_path", "thread_id"],
+        additionalProperties: false,
       },
-      required: ["target_host", "db_path", "thread_id"],
-      additionalProperties: false,
-    },
-  });
+    });
+  }
 
   result.push(
     {
       name: "plan_cross_device_cleanup",
       description:
-        "Plan current-thread descendants: all remote endpoints must finish before any local deletion. Registry must contain verified T3 identities and parent edges.",
+        "Plan current-thread descendants or ancestor pruning: all remote endpoints must finish before any local step. Supports action='delete' or action='archive'.",
       inputSchema: {
         type: "object",
         properties: {
@@ -112,6 +127,11 @@ export function toolDefinitions() {
             type: "string",
             enum: ["descendants_only", "preserve_current_subtree"],
             default: "descendants_only",
+          },
+          action: {
+            type: "string",
+            enum: ["delete", "archive"],
+            default: "delete",
           },
         },
         required: [
@@ -125,7 +145,7 @@ export function toolDefinitions() {
     {
       name: "execute_cleanup_step",
       description:
-        "Execute one planned endpoint on its owning machine. Remote success receipts are mandatory before local deletion. Current coordinator and worker are protected. Defaults to preview.",
+        "Execute one planned endpoint on its owning machine (delete or archive per plan.action). Remote success receipts are mandatory before local execution. Current coordinator and worker are protected. Defaults to preview.",
       inputSchema: {
         type: "object",
         properties: {
@@ -155,7 +175,8 @@ export async function callTool(
       args.anchor_node_id,
       args.current_environment_id,
       args.current_thread_id,
-      args.scope ?? "descendants_only"
+      args.scope ?? "descendants_only",
+      args.action ?? "delete"
     );
   }
 
@@ -253,30 +274,35 @@ export async function callTool(
   }
 
   const dryRun = args.dry_run === undefined ? true : args.dry_run;
-  if (name === "schedule_delete_family") {
+  if (name === "schedule_delete_family" || name === "schedule_archive_family") {
+    const schedAction = name === "schedule_archive_family" ? "archive" : "delete";
     if (!t3Url) {
       throw new Error(
-        "schedule_delete_family requires a running online T3 server (--t3-url or --auto-local)"
+        `${name} requires a running online T3 server (--t3-url or --auto-local)`
       );
     }
     const preview = cleanFamily(args.thread_id, dbConfigPath, {
       dryRun: true,
       keepParent: false,
-      action: "delete",
+      action: schedAction,
     });
     if (!preview.parentSelected) {
-      throw new Error(`Thread ${args.thread_id} was not found or is already deleted`);
+      throw new Error(
+        `Thread ${args.thread_id} was not found or is already ${schedAction}d`
+      );
     }
     const delayMs = args.delay_ms ?? 1500;
+    const subDir = schedAction === "archive" ? "self-archive" : "self-delete";
     if (dryRun) {
       return {
         target,
         ...preview,
         delay_ms: delayMs,
-        receipt_dir: join(defaultCleanupStateDir(), "self-delete"),
+        receipt_dir: join(defaultCleanupStateDir(), subDir),
       };
     }
     const scheduled = spawnSelfDeleteFn({
+      action: schedAction,
       target_host: args.target_host,
       db_path: dbConfigPath,
       thread_id: args.thread_id,
@@ -286,7 +312,10 @@ export async function callTool(
     return {
       target,
       ...preview,
-      status: "scheduled_detached_delete",
+      status:
+        schedAction === "archive"
+          ? "scheduled_detached_archive"
+          : "scheduled_detached_delete",
       ...scheduled,
     };
   }
@@ -301,23 +330,24 @@ export async function callTool(
     );
   }
 
-  const action = args.archive_only ? "archive" : "delete";
-  const result =
-    name === "delete_orphans"
-      ? cleanOrphans(dbConfigPath, {
-          dryRun: t3Url ? true : dryRun,
-          action,
-        })
-      : cleanFamily(args.thread_id, dbConfigPath, {
-          dryRun: t3Url ? true : dryRun,
-          keepParent:
-            name === "delete_subsessions"
-              ? true
-              : args.keep_parent === undefined
-                ? true
-                : args.keep_parent,
-          action: "delete",
-        });
+  const action =
+    name.startsWith("archive_") || args.archive_only === true ? "archive" : "delete";
+  const isOrphans = name.endsWith("_orphans");
+  const isSubsessions = name.endsWith("_subsessions");
+  const result = isOrphans
+    ? cleanOrphans(dbConfigPath, {
+        dryRun: t3Url ? true : dryRun,
+        action,
+      })
+    : cleanFamily(args.thread_id, dbConfigPath, {
+        dryRun: t3Url ? true : dryRun,
+        keepParent: isSubsessions
+          ? true
+          : args.keep_parent === undefined
+            ? true
+            : args.keep_parent,
+        action,
+      });
 
   if (t3Url && !dryRun) {
     const items = result.orphans ?? result.children ?? [];
@@ -366,6 +396,7 @@ export async function callTool(
 
     result.status = "completed_via_t3";
     result.parentDeleted = Boolean(result.parentSelected) && action === "delete";
+    result.parentArchived = Boolean(result.parentSelected) && action === "archive";
     for (const item of items) {
       delete item.dryRun;
     }
@@ -545,8 +576,12 @@ export async function runMain(argv = process.argv.slice(2)) {
 
   if (config.detachedWorker) {
     try {
-      await runDetachedWorker(config.detachedWorker, (args, jobConfig) =>
-        callTool("delete_family", args, jobConfig)
+      await runDetachedWorker(config.detachedWorker, (args, jobConfig, jobAction) =>
+        callTool(
+          jobAction === "archive" ? "archive_family" : "delete_family",
+          args,
+          jobConfig
+        )
       );
     } catch {
       process.exit(1);

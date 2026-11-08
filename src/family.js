@@ -9,10 +9,14 @@ export function planCleanup(
   anchorNodeId,
   currentEnvironmentId,
   currentThreadId,
-  scope = "descendants_only"
+  scope = "descendants_only",
+  action = "delete"
 ) {
   if (scope !== "descendants_only" && scope !== "preserve_current_subtree") {
     throw new Error("Unknown cleanup scope");
+  }
+  if (action !== "delete" && action !== "archive") {
+    throw new Error("Unknown cleanup action");
   }
   const rawNodes = registry?.nodes;
   if (!Array.isArray(rawNodes)) {
@@ -158,6 +162,7 @@ export function planCleanup(
 
   return {
     scope,
+    action,
     order: "remote_then_local",
     anchor_node_id: anchorNodeId,
     family_root_node_id: root,
@@ -175,9 +180,11 @@ export async function executeStep(
   dryRun = true,
   { dispatchFn = dispatchT3Commands } = {}
 ) {
+  const modeAction = plan?.action ?? "delete";
   if (
     !plan ||
     (plan.scope !== "descendants_only" && plan.scope !== "preserve_current_subtree") ||
+    (modeAction !== "delete" && modeAction !== "archive") ||
     plan.order !== "remote_then_local"
   ) {
     throw new Error("Expected a supported remote-first plan");
@@ -203,6 +210,11 @@ export async function executeStep(
     throw new Error("Cannot stop or delete the current/coordinator thread");
   }
 
+  const okStatuses =
+    modeAction === "archive"
+      ? new Set(["archived", "already_archived", "already_deleted"])
+      : new Set(["deleted", "already_deleted"]);
+
   function confirmed(key) {
     const expected = steps.get(key);
     return receipts.some(
@@ -210,7 +222,7 @@ export async function executeStep(
         r?.node_id === key &&
         r?.environment_id === expected.environment_id &&
         r?.thread_id === expected.thread_id &&
-        (r?.status === "deleted" || r?.status === "already_deleted")
+        okStatuses.has(r?.status)
     );
   }
 
@@ -224,7 +236,7 @@ export async function executeStep(
   }
   const missing = [...new Set(required.filter((key) => !confirmed(key)))].sort();
   if (missing.length > 0) {
-    return { ...step, status: "blocked", pending: missing };
+    return { ...step, action: modeAction, status: "blocked", pending: missing };
   }
 
   const t3Url = config.t3Url ?? config.t3_url;
@@ -234,44 +246,67 @@ export async function executeStep(
   }
 
   const tid = step.thread_id;
+  const preProtectedArchived = new Map();
+  const selectCols = modeAction === "archive" ? "deleted_at, archived_at" : "deleted_at";
   const precheck = withDatabase(dbPath, { readOnly: true }, (db) => {
+    if (modeAction === "archive") {
+      for (const item of plan.protected) {
+        if (item.environment_id !== env) continue;
+        const prow = db
+          .prepare(
+            "SELECT archived_at FROM orchestration_v2_projection_threads WHERE thread_id = ?"
+          )
+          .get(item.thread_id);
+        preProtectedArchived.set(item.thread_id, Boolean(prow?.archived_at));
+      }
+    }
     const row = db
       .prepare(
-        "SELECT deleted_at FROM orchestration_v2_projection_threads WHERE thread_id = ?"
+        `SELECT ${selectCols} FROM orchestration_v2_projection_threads WHERE thread_id = ?`
       )
       .get(tid);
     if (!row) {
       return {
         ...step,
+        action: modeAction,
         status: "unverified",
         reason: "Thread not found in this environment",
       };
     }
     if (row.deleted_at) {
-      return { ...step, status: "already_deleted" };
+      return { ...step, action: modeAction, status: "already_deleted" };
+    }
+    if (modeAction === "archive" && row.archived_at) {
+      return { ...step, action: modeAction, status: "already_archived" };
     }
     const descendants = findDescendantTree(db, tid);
-    for (const d of descendants) {
-      const lineage = JSON.parse(d.payload_json).lineage || {};
-      if (
-        protectedPairs.has(`${env}\0${d.thread_id}`) &&
-        lineage.sideChat === true &&
-        lineage.parentThreadId === tid
-      ) {
-        return {
-          ...step,
-          status: "blocked",
-          reason:
-            "T3 would cascade-delete a protected side chat; a supported detach operation is required",
-        };
+    if (modeAction === "delete") {
+      for (const d of descendants) {
+        const lineage = JSON.parse(d.payload_json).lineage || {};
+        if (
+          protectedPairs.has(`${env}\0${d.thread_id}`) &&
+          lineage.sideChat === true &&
+          lineage.parentThreadId === tid
+        ) {
+          return {
+            ...step,
+            action: modeAction,
+            status: "blocked",
+            reason:
+              "T3 would cascade-delete a protected side chat; a supported detach operation is required",
+          };
+        }
       }
     }
     const remaining = descendants.filter(
-      (d) => !protectedPairs.has(`${env}\0${d.thread_id}`)
+      (d) =>
+        !protectedPairs.has(`${env}\0${d.thread_id}`) &&
+        (modeAction === "archive" ? d.archived_at == null : true)
     );
     if (remaining.length > 0) {
       return {
         ...step,
+        action: modeAction,
         status: "blocked",
         reason: "Live local descendants remain; refresh the plan",
         remaining: remaining.map((d) => d.thread_id),
@@ -284,10 +319,10 @@ export async function executeStep(
     return precheck;
   }
   if (dryRun) {
-    return { ...step, status: "ready" };
+    return { ...step, action: modeAction, status: "ready" };
   }
 
-  const commands = [{ type: "thread.delete", threadId: tid }];
+  const commands = [{ type: `thread.${modeAction}`, threadId: tid }];
   if (!step.ancestor) {
     commands.unshift({
       type: "thread.stop",
@@ -306,6 +341,7 @@ export async function executeStep(
   } catch (err) {
     return {
       ...step,
+      action: modeAction,
       status: "failed",
       reason: String(err?.message || err).slice(-1500),
     };
@@ -314,7 +350,7 @@ export async function executeStep(
   return withDatabase(dbPath, { readOnly: true }, (db) => {
     const row = db
       .prepare(
-        "SELECT deleted_at FROM orchestration_v2_projection_threads WHERE thread_id = ?"
+        `SELECT ${selectCols} FROM orchestration_v2_projection_threads WHERE thread_id = ?`
       )
       .get(tid);
     for (const item of plan.protected) {
@@ -323,21 +359,28 @@ export async function executeStep(
       }
       const kept = db
         .prepare(
-          "SELECT deleted_at FROM orchestration_v2_projection_threads WHERE thread_id = ?"
+          `SELECT ${selectCols} FROM orchestration_v2_projection_threads WHERE thread_id = ?`
         )
         .get(item.thread_id);
-      if (!kept || kept.deleted_at != null) {
+      const unexpectedlyArchived =
+        modeAction === "archive" &&
+        !preProtectedArchived.get(item.thread_id) &&
+        kept?.archived_at != null;
+      if (!kept || kept.deleted_at != null || unexpectedlyArchived) {
         return {
           ...step,
+          action: modeAction,
           status: "failed",
           reason: "Protected thread preservation could not be verified",
           protected_thread_id: item.thread_id,
         };
       }
     }
+    const ok = modeAction === "archive" ? Boolean(row?.archived_at) : Boolean(row?.deleted_at);
     return {
       ...step,
-      status: row && row.deleted_at ? "deleted" : "unverified",
+      action: modeAction,
+      status: ok ? (modeAction === "archive" ? "archived" : "deleted") : "unverified",
     };
   });
 }

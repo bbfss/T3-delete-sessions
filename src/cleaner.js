@@ -174,30 +174,32 @@ export function cleanFamily(
   return withDatabase(dbPath, { readOnly: dryRun }, (db) => {
     const targetRow = db
       .prepare(
-        "SELECT thread_id, title, payload_json FROM orchestration_v2_projection_threads WHERE thread_id = ?"
+        "SELECT thread_id, title, deleted_at, archived_at, payload_json FROM orchestration_v2_projection_threads WHERE thread_id = ?"
       )
       .get(threadId);
-    if (!targetRow) {
+    if (!targetRow || targetRow.deleted_at != null) {
       throw new Error(`Session ${threadId} not found in database.`);
     }
 
-    const descendants = findDescendantTree(db, threadId);
-    let deletedChildren = [];
-    let parentDeleted = false;
+    const descendants = findDescendantTree(db, threadId).filter((d) =>
+      action === "archive" ? d.archived_at == null : true
+    );
+    let processedChildren = [];
+    let parentProcessed = false;
 
     if (!dryRun) {
       withTransaction(db, () => {
         for (const d of descendants) {
           markThreadDeleted(db, d.thread_id, d.payload_json, { action });
-          deletedChildren.push({ threadId: d.thread_id, title: d.title });
+          processedChildren.push({ threadId: d.thread_id, title: d.title });
         }
-        if (!keepParent) {
+        if (!keepParent && (action !== "archive" || targetRow.archived_at == null)) {
           markThreadDeleted(db, threadId, targetRow.payload_json, { action });
-          parentDeleted = true;
+          parentProcessed = true;
         }
       });
     } else {
-      deletedChildren = descendants.map((d) => ({
+      processedChildren = descendants.map((d) => ({
         threadId: d.thread_id,
         title: d.title,
         dryRun: true,
@@ -206,11 +208,13 @@ export function cleanFamily(
 
     return {
       status: dryRun ? "preview" : "updated_offline_database",
+      action,
       parentThreadId: threadId,
-      parentDeleted: parentDeleted && action === "delete",
-      parentSelected: !keepParent,
-      childrenCount: deletedChildren.length,
-      children: deletedChildren,
+      parentDeleted: parentProcessed && action === "delete",
+      parentArchived: parentProcessed && action === "archive",
+      parentSelected: !keepParent && (action !== "archive" || targetRow.archived_at == null),
+      childrenCount: processedChildren.length,
+      children: processedChildren,
     };
   });
 }

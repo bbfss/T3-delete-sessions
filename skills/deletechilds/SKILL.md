@@ -7,7 +7,7 @@ description: 显式 /deletechilds 或 $deletechilds 清理当前会话的全部�
 
 只有用户实际发送 `/deletechilds`、`$deletechilds`（T3 斜杠菜单选择 Skill 后自动插入 `$deletechilds`）或对应 Skill 才执行。讨论、引用、自动登记不授权删除。不再调用旧的 `t3-clean-sessions --current`。
 
-使用 T3-delete-sessions 1.6.0+（纯 Node.js 零外部依赖）。若 MCP 尚未刷新或宿主未挂载外部 MCP，可在目标机器以单次工具模式调用：
+使用 T3-delete-sessions 1.7.0+（纯 Node.js 零外部依赖）。若当前会话无跨设备远端后代（本机 `session-family-cleanup` 无远端登记且未发起过远端委派），直接走单机快路径：用 `t3_thread_list` 核实真实 `currentThreadId`，调用 `inspect_target` 与 `delete_subsessions(target_host=..., db_path=..., thread_id=currentThreadId, dry_run=true -> false)` 秒级完成（当前根会话保留）。若未挂载 MCP，可在目标机器以单次工具模式调用：
 
 ```sh
 npx -y github:bbfss/T3-delete-sessions --auto-local --call inspect_target --arguments-file request.json
@@ -15,7 +15,7 @@ npx -y github:bbfss/T3-delete-sessions --auto-local --call inspect_target --argu
 
 request.json 为对应工具参数对象；inspect_target 使用 `{}`。其他工具同理替换 --call。不把其他设备的路径或凭据复制到本机。仅需 Node.js（>=22.12）及本机官方 t3 CLI（无需 Python 或第三方 npm 依赖）；自定义T3目录用明确的--db、--t3-url、--t3-cli代替--auto-local。
 
-## 固定目标与计划
+## 跨设备固定目标与计划（存在远端后代时）
 
 1. 复用 archivesessions 的会话族登记。用宿主/T3工具核实当前真实 environmentId、threadId；补齐每个后代的直属parentNodeId及所属T3端点。不依据标题、最近活动、cwd猜ID。通过 `t3_environment_links` 核实远端可达性；回读目标会话和委派记录，不能仅凭登记文件就删除。
 2. 当前会话是锚点且永久保留。协调者、正在执行的远端清理worker及其端点均排除。缺失身份或关系时先补查，不能把未知分支当成没有后代。

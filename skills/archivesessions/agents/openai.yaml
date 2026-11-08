@@ -1,0 +1,4 @@
+interface:
+  display_name: "archivesessions"
+  short_description: "自动登记会话树；仅归档或删除当前会话后代，保留当前会话"
+  default_prompt: "/archivesessions"

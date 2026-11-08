@@ -172,3 +172,134 @@ test("spawnDetachedSelfDelete supports win32 WMI launcher and runDetachedWorker 
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("symmetric archive tools (archive_subsessions, schedule_archive_family, and cross-device archive) work end-to-end", async () => {
+  const { root, db } = createSelfDeleteFixture();
+  try {
+    writeFileSync(join(root, "userdata", "environment-id"), "env-local\n", "utf8");
+
+    const subPreview = await callTool(
+      "archive_subsessions",
+      { target_host: os.hostname(), db_path: db, thread_id: "root-1", dry_run: true },
+      { db, t3Url: "http://127.0.0.1:3773" }
+    );
+    assert.equal(subPreview.action, "archive");
+    assert.equal(subPreview.parentSelected, false);
+    assert.equal(subPreview.childrenCount, 1);
+
+    const scheduled = spawnDetachedSelfDelete(
+      {
+        action: "archive",
+        target_host: os.hostname(),
+        db_path: db,
+        thread_id: "root-1",
+        delay_ms: 200,
+        config: { db, t3Url: "http://127.0.0.1:3773", t3Cli: "t3" },
+      },
+      {
+        platform: "darwin",
+        stateBaseDir: join(root, "state"),
+        spawnFn: () => ({ pid: 61616, unref() {} }),
+      }
+    );
+    assert.equal(scheduled.action, "archive");
+    assert.match(scheduled.receipt_path, /self-archive/);
+
+    const archiveReceipt = await runDetachedWorker(
+      scheduled.job_path,
+      async (args, jobConfig, jobAction) =>
+        callTool(
+          jobAction === "archive" ? "archive_family" : "delete_family",
+          args,
+          jobConfig,
+          {
+            dispatchFn: async ({ commands }) => {
+              assert.deepEqual(
+                commands.map((c) => `${c.type}:${c.threadId}`),
+                [
+                  "thread.stop:child-1",
+                  "thread.archive:child-1",
+                  "thread.stop:root-1",
+                  "thread.archive:root-1",
+                ]
+              );
+              withDatabase(db, { readOnly: false }, (conn) => {
+                conn
+                  .prepare(
+                    "UPDATE orchestration_v2_projection_threads SET archived_at = 'now' WHERE thread_id IN ('child-1', 'root-1')"
+                  )
+                  .run();
+              });
+            },
+          }
+        ),
+      { sleepFn: async () => {} }
+    );
+    assert.equal(archiveReceipt.status, "completed_via_t3");
+    assert.equal(archiveReceipt.action, "archive");
+    assert.equal(archiveReceipt.parentArchived, true);
+    assert.equal(archiveReceipt.parentDeleted, false);
+    assert.equal(archiveReceipt.childrenArchived, 1);
+
+    // Reset archived_at on child-1 and test cross-device plan + execute_cleanup_step with action='archive'
+    withDatabase(db, { readOnly: false }, (conn) => {
+      conn
+        .prepare("UPDATE orchestration_v2_projection_threads SET archived_at = NULL")
+        .run();
+    });
+
+    const plan = await callTool("plan_cross_device_cleanup", {
+      registry: {
+        nodes: [
+          {
+            nodeId: "root",
+            parentNodeId: null,
+            t3: { environmentId: "env-local", threadId: "root-1" },
+          },
+          {
+            nodeId: "c1",
+            parentNodeId: "root",
+            t3: { environmentId: "env-local", threadId: "child-1" },
+          },
+        ],
+      },
+      anchor_node_id: "root",
+      current_environment_id: "env-local",
+      current_thread_id: "root-1",
+      scope: "descendants_only",
+      action: "archive",
+    });
+    assert.equal(plan.action, "archive");
+
+    const stepRes = await callTool(
+      "execute_cleanup_step",
+      {
+        plan,
+        node_id: "c1",
+        receipts: [],
+        worker_thread_id: "worker-1",
+        dry_run: false,
+      },
+      { db, t3Url: "http://127.0.0.1:3773" },
+      {
+        dispatchFn: async ({ commands }) => {
+          assert.deepEqual(
+            commands.map((c) => `${c.type}:${c.threadId}`),
+            ["thread.stop:child-1", "thread.archive:child-1"]
+          );
+          withDatabase(db, { readOnly: false }, (conn) => {
+            conn
+              .prepare(
+                "UPDATE orchestration_v2_projection_threads SET archived_at = 'now' WHERE thread_id = 'child-1'"
+              )
+              .run();
+          });
+        },
+      }
+    );
+    assert.equal(stepRes.status, "archived");
+    assert.equal(stepRes.action, "archive");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});

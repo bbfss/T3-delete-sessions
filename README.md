@@ -144,16 +144,19 @@ planning/execution. Only Node.js (`>= 22.12`) and the local T3 CLI are required 
 Existing T3 links and authorization are required for delegated workers. The
 current thread stays available to collect outcomes and retry blocked branches.
 
-### Slash & `$` skill command scope
+### Slash & `$` skill command scope (`t3-sessions-manager` suite)
 
-Both `/command` and `$command` triggers are supported (selecting a skill from T3 Code's `/` composer menu inserts `$<skill-name>` such as `$deletefamily`):
+All 9 skills live under `skills/` and group together in Magpie under **`t3-sessions-manager`** (`skillGroups` in `library.json`). Both `/command` and `$command` triggers are supported (`/` menu in T3 Code inserts `$<skill-name>`):
 
-- `/deletechilds` (`$deletechilds`): preserves the invoking thread and deletes verified descendants.
-- `/deletefamily` (`$deletefamily`): includes the invoking thread as the final target. For single-environment sessions without remote descendants, `schedule_delete_family` completes the detached self-deletion handoff in seconds and writes a verified receipt under `~/.local/state/session-family-cleanup/self-delete/` (or `%LOCALAPPDATA%\session-family-cleanup\self-delete\` on Windows). When remote descendants exist, all remote steps must succeed before local/root deletion.
-- `/deletefathers` (`$deletefathers`): preserves the invoking thread and all of its descendants, and removes every ancestor and the other branches of that same family (`scope: "preserve_current_subtree"`).
-- `/deleteorphans` (`$deleteorphans`): previews and cleans verified local orphan trees.
+| Scope | Archive (recoverable via T3 Archive) | Delete (marks session deleted) |
+|---|---|---|
+| **Descendants only** (preserve current session) | `/archivechilds` (`$archivechilds`, legacy alias `/archivesessions`) | `/deletechilds` (`$deletechilds`) |
+| **Entire current family** (descendants + current root session) | `/archivefamily` (`$archivefamily`, via `schedule_archive_family`) | `/deletefamily` (`$deletefamily`, via `schedule_delete_family`) |
+| **Preserve current subtree**, prune all ancestors & sibling branches | `/archivefathers` (`$archivefathers`) | `/deletefathers` (`$deletefathers`) |
+| **Verified orphan session trees** | `/archiveorphans` (`$archiveorphans`) | `/deleteorphans` (`$deleteorphans`) |
 
-`/deletesessions` and `/deletesubsessions` are removed slash commands, not aliases. MCP tool names remain stable.
+- `archivesessions`: automatic cross-provider / cross-device startup lineage registration (`session-family-cleanup/<familyId>/`); never archives or deletes on startup.
+- `/deletesessions` and `/deletesubsessions` are removed slash commands, not aliases. MCP tools expose symmetric `archive_subsessions`, `archive_family`, `archive_orphans`, `schedule_archive_family` alongside `delete_subsessions`, `delete_family`, `delete_orphans`, `schedule_delete_family`, plus `action: "delete" | "archive"` on `plan_cross_device_cleanup`.
 
 ## T3 Code + Antigravity (`GEMINI_HOME` Isolation & Magpie Sync)
 
