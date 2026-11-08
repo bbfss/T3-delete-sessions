@@ -1,13 +1,28 @@
 {
-  "name": "t3-delete-sessions-mcp",
+  "name": "t3-delete-sessions",
   "version": "1.0.0",
   "description": "T3 Code Session Cascading Cleaner & Orphan Purger MCP Server",
-  "main": "server.py",
+  "type": "module",
+  "bin": {
+    "t3-delete-sessions": "./bin/cli.js"
+  },
+  "main": "bin/cli.js",
+  "files": [
+    "bin",
+    "server.py",
+    "cleaner.py",
+    "README.md"
+  ],
   "scripts": {
-    "start": "python3 server.py"
+    "start": "node ./bin/cli.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bbfss/T3-delete-sessions.git"
   },
   "keywords": [
     "t3",
+    "t3-code",
     "mcp",
     "session-cleaner",
     "cascade-delete",

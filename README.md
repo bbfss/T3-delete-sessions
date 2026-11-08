@@ -13,39 +13,49 @@ A comprehensive, deterministic session cascading cleaner and orphan purger for *
   - Cleans up underlying provider sessions (Codex, Antigravity, etc.)
   - Safely purges temporary scratch worktrees in `~/.t3/scratch/`
 
-## MCP Server Setup
+---
 
-Add this to your MCP configuration (e.g. Claude Desktop, T3 Code, or Antigravity):
+## Quick Setup via NPX (Zero Install)
+
+You can run this MCP directly with `npx` without cloning or installing dependencies.
+
+Add this to your MCP configuration (e.g., T3 Code, Claude Desktop, Cursor):
 
 ```json
 {
   "mcpServers": {
     "t3-delete-sessions": {
-      "command": "python3",
-      "args": ["/path/to/T3-delete-sessions/server.py"]
+      "command": "npx",
+      "args": ["-y", "github:bbfss/T3-delete-sessions"]
     }
   }
 }
 ```
 
-### Exposed MCP Tools
+*(Once published to the npm registry, you can also use `["-y", "t3-delete-sessions"]`)*
 
-1. `delete_orphans`: Scan and purge all orphan sessions in T3.
-2. `delete_family`: Cascade delete a target session and all descendants.
-3. `delete_subsessions`: Clean only child subagents, keeping the parent session alive.
+---
 
-## CLI Usage
+## Exposed MCP Tools
 
-You can also run `cleaner.py` directly from the terminal:
+1. **`delete_orphans`**: Scan and purge all orphan sessions in T3 (sessions whose parent session was deleted).
+2. **`delete_family`**: Cascade delete a target session and all of its descendants bottom-up (连根拔起).
+3. **`delete_subsessions`**: Clean only child subagents, keeping the parent session active for further chat.
+
+---
+
+## Local Development & CLI Usage
+
+You can also run the cleaner script directly from the terminal:
 
 ```bash
-# Clean orphans
+# Scan and clean all orphan sessions
 python3 cleaner.py --orphans
 
-# Cascade delete target session and its children
+# Cascade delete a specific session and all its child tasks
 python3 cleaner.py --thread <THREAD_ID>
 
-# Clean subagents of current session
+# Clean all child subagents under the current session (keep parent)
 python3 cleaner.py --current --keep-parent
 ```
 
