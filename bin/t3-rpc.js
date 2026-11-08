@@ -1,19 +1,20 @@
-import WebSocket from 'ws';
-import {randomUUID} from 'node:crypto';
-import {execT3Cli} from './platform.js';
-let input=''; for await (const chunk of process.stdin) input+=chunk;
-const request=JSON.parse(input);
-const token=execT3Cli(request.cli,['auth','session','issue','--base-dir',request.baseDir,'--ttl','5m','--token-only']).trim();
-const url=new URL('/ws',request.url);url.protocol=url.protocol==='https:'?'wss:':'ws:';url.searchParams.set('orchestrationProtocol','2');
-const ws=new WebSocket(url,{headers:{Authorization:`Bearer ${token}`}});
-const timer=setTimeout(()=>{console.error('T3 command timed out; inspect target state before retrying');process.exit(1)},30000);
-let index=0;const results=[];
-function send(){ws.send(JSON.stringify({_tag:'Request',id:String(index),tag:'orchestration.dispatchCommand',payload:{commandId:randomUUID(),...request.commands[index]},headers:[]}))}
-ws.on('open',send);
-ws.on('message',raw=>{for(const msg of [JSON.parse(raw.toString())].flat()){
- if(msg._tag!=='Exit'||msg.requestId!==String(index))continue;
- if(msg.exit._tag!=='Success'){console.error(JSON.stringify(msg.exit));process.exit(1)}
- results.push(msg.exit.value);index++;
- if(index<request.commands.length)send();else{clearTimeout(timer);console.log(JSON.stringify(results));ws.close()}
-}});
-ws.on('error',e=>{console.error(e.message);process.exit(1)});
+import { dispatchT3Commands } from "../src/ws-rpc.js";
+
+let input = "";
+for await (const chunk of process.stdin) {
+  input += chunk;
+}
+const request = JSON.parse(input);
+
+try {
+  const results = await dispatchT3Commands({
+    cli: request.cli,
+    baseDir: request.baseDir,
+    url: request.url,
+    commands: request.commands,
+  });
+  process.stdout.write(`${JSON.stringify(results)}\n`);
+} catch (err) {
+  process.stderr.write(`${err.message || err}\n`);
+  process.exit(1);
+}

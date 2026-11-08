@@ -7,13 +7,13 @@ description: 显式 /deletechilds 清理当前会话的全部已核实后代，�
 
 只有用户实际发送 `/deletechilds` 或对应 Skill 才执行。讨论、引用、自动登记不授权删除。不再调用旧的 `t3-clean-sessions --current`。
 
-使用 T3-delete-sessions 1.4.0+。若 MCP 尚未刷新，可在目标机器以单次工具模式调用：
+使用 T3-delete-sessions 1.5.0+（纯 Node.js 零外部依赖）。若 MCP 尚未刷新，可在目标机器以单次工具模式调用：
 
 ```sh
 npx -y github:bbfss/T3-delete-sessions --auto-local --call inspect_target --arguments-file request.json
 ```
 
-request.json 为对应工具参数对象；inspect_target 使用 `{}`。其他工具同理替换 --call。不把其他设备的路径或凭据复制到本机。Node、Python3及本机官方t3 CLI必须可用；自定义T3目录用明确的--db、--t3-url、--t3-cli代替--auto-local。
+request.json 为对应工具参数对象；inspect_target 使用 `{}`。其他工具同理替换 --call。不把其他设备的路径或凭据复制到本机。仅需 Node.js（>=22.12）及本机官方 t3 CLI（无需 Python 或第三方 npm 依赖）；自定义T3目录用明确的--db、--t3-url、--t3-cli代替--auto-local。
 
 ## 固定目标与计划
 

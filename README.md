@@ -1,7 +1,7 @@
 # T3-delete-sessions
 
 MCP tools to inspect T3 session families and clean them through a running T3 server or maintain an offline database.
-Requires Node.js and Python 3 with SQLite support.
+Runs natively in Node.js (`>= 22.12`, built-in `node:sqlite` + built-in HTTP/WebSocket) with **zero Python or third-party npm dependencies**.
 
 ## Setup
 
@@ -71,7 +71,7 @@ state. Tokens stay inside the command process. A failure may follow successful
 earlier commands; inspect the family before retrying. This mode does not require
 `offline_confirmed` or `--allow-offline-writes`.
 
-Requires the official T3 CLI on the MCP host (`t3` or Windows `t3.cmd`), Node.js and Python 3.8+ (`python3`, `python`, or `py -3`; broken `WindowsApps` Store aliases are skipped automatically, and `T3_DELETE_SESSIONS_PYTHON` overrides the interpreter path if needed). The database
+Requires only Node.js (`>= 22.12`) and the official T3 CLI on the MCP host (`t3` or Windows `t3.cmd`) — no Python runtime or external npm packages are required. The database
 must be at `<base-dir>/userdata/statev2.sqlite`. The server URL must belong to
 that base directory; a different environment will reject its bearer token.
 The server remains running during cleanup. The UI delete button itself is not patched.
@@ -90,7 +90,7 @@ Provider-native sessions, artifacts, scratch directories and worktrees are prese
 A preview reports `parentDeleted: false`; successful writes report
 `updated_offline_database`, not physical deletion.
 
-The SQL targets the schema exercised in `tests/test_cleaner.py`; compatibility
+The SQL targets the schema exercised in `tests/test_cleaner.mjs`; compatibility
 with arbitrary T3 releases, side-chat relationships and cross-device families is
 not established. Online parent/child/grandchild cleanup was verified on T3 0.1.7. Descendants use lineage, delegatedFrom and subagent records.
 The tools do not patch the T3 UI delete button or clean remote machines implicitly.
@@ -139,7 +139,7 @@ npx -y github:bbfss/T3-delete-sessions --auto-local --call inspect_target --argu
 ```
 
 `inspect.json` contains `{}`. Use the appropriate tool name and argument file for
-planning/execution. The Node/Python/T3 CLI prerequisites apply on every worker.
+planning/execution. Only Node.js (`>= 22.12`) and the local T3 CLI are required on each worker (no Python or third-party npm dependencies).
 Existing T3 links and authorization are required for delegated workers. The
 current thread stays available to collect outcomes and retry blocked branches.
 
