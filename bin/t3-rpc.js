@@ -1,9 +1,9 @@
 import WebSocket from 'ws';
-import {execFileSync} from 'node:child_process';
 import {randomUUID} from 'node:crypto';
+import {execT3Cli} from './platform.js';
 let input=''; for await (const chunk of process.stdin) input+=chunk;
 const request=JSON.parse(input);
-const token=execFileSync(request.cli,['auth','session','issue','--base-dir',request.baseDir,'--ttl','5m','--token-only'],{encoding:'utf8',stdio:['ignore','pipe','pipe']}).trim();
+const token=execT3Cli(request.cli,['auth','session','issue','--base-dir',request.baseDir,'--ttl','5m','--token-only']).trim();
 const url=new URL('/ws',request.url);url.protocol=url.protocol==='https:'?'wss:':'ws:';url.searchParams.set('orchestrationProtocol','2');
 const ws=new WebSocket(url,{headers:{Authorization:`Bearer ${token}`}});
 const timer=setTimeout(()=>{console.error('T3 command timed out; inspect target state before retrying');process.exit(1)},30000);

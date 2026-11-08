@@ -71,7 +71,7 @@ state. Tokens stay inside the command process. A failure may follow successful
 earlier commands; inspect the family before retrying. This mode does not require
 `offline_confirmed` or `--allow-offline-writes`.
 
-Requires the official T3 CLI on the MCP host, Node.js and Python 3. The database
+Requires the official T3 CLI on the MCP host (`t3` or Windows `t3.cmd`), Node.js and Python 3.8+ (`python3`, `python`, or `py -3`; broken `WindowsApps` Store aliases are skipped automatically, and `T3_DELETE_SESSIONS_PYTHON` overrides the interpreter path if needed). The database
 must be at `<base-dir>/userdata/statev2.sqlite`. The server URL must belong to
 that base directory; a different environment will reject its bearer token.
 The server remains running during cleanup. The UI delete button itself is not patched.
@@ -99,7 +99,7 @@ The tools do not patch the T3 UI delete button or clean remote machines implicit
 
 ```sh
 npm test
-python3 server.py --help
+node ./bin/cli.js --help
 ```
 
 Tests use temporary synthetic databases and never open the user's T3 database.

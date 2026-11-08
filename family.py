@@ -4,7 +4,7 @@ import sqlite3
 import subprocess
 from pathlib import Path
 from contextlib import closing
-from cleaner import find_descendant_tree
+from cleaner import find_descendant_tree, node_executable, sqlite_uri
 
 
 def plan_cleanup(registry, anchor_node_id, current_environment_id, current_thread_id,
@@ -89,7 +89,7 @@ def execute_step(plan, node_id, receipts, config, worker_thread_id, dry_run=True
         raise ValueError('Expected a supported remote-first plan')
     steps = {s['node_id']: s for s in plan['steps']}
     step = steps[node_id]
-    env = (config.db.parent / 'environment-id').read_text().strip()
+    env = (config.db.parent / 'environment-id').read_text(encoding='utf-8').strip()
     if step['environment_id'] != env:
         raise ValueError('Step belongs to another T3 environment')
     protected = {(p['environment_id'], p['thread_id']) for p in plan['protected']}
@@ -110,7 +110,7 @@ def execute_step(plan, node_id, receipts, config, worker_thread_id, dry_run=True
     if not config.t3_url:
         raise ValueError('Cross-device cleanup requires official online T3 commands')
     tid = step['thread_id']
-    with closing(sqlite3.connect(config.db.resolve().as_uri() + '?mode=ro', uri=True)) as conn:
+    with closing(sqlite3.connect(sqlite_uri(config.db, 'ro'), uri=True)) as conn:
         conn.row_factory = sqlite3.Row
         row = conn.execute('SELECT deleted_at FROM orchestration_v2_projection_threads WHERE thread_id=?', (tid,)).fetchone()
         if row is None:
@@ -131,13 +131,13 @@ def execute_step(plan, node_id, receipts, config, worker_thread_id, dry_run=True
     commands = [{'type': 'thread.delete', 'threadId': tid}]
     if not step.get('ancestor'):
         commands.insert(0, {'type': 'thread.stop', 'threadId': tid, 'stopDelegatedTasks': False})
-    proc = subprocess.run(['node', str(Path(__file__).parent / 'bin/t3-rpc.js')],
+    proc = subprocess.run([node_executable(), str(Path(__file__).parent / 'bin/t3-rpc.js')],
         input=json.dumps({'cli': config.t3_cli, 'baseDir': str(config.db.parent.parent), 'url': config.t3_url,
                           'commands': commands}),
-        text=True, capture_output=True, timeout=40)
+        text=True, encoding='utf-8', capture_output=True, timeout=40)
     if proc.returncode:
         return {**step, 'status': 'failed', 'reason': proc.stderr[-1500:]}
-    with closing(sqlite3.connect(config.db.resolve().as_uri() + '?mode=ro', uri=True)) as conn:
+    with closing(sqlite3.connect(sqlite_uri(config.db, 'ro'), uri=True)) as conn:
         row = conn.execute('SELECT deleted_at FROM orchestration_v2_projection_threads WHERE thread_id=?', (tid,)).fetchone()
         for item in plan['protected']:
             protected_env, protected_tid = item['environment_id'], item['thread_id']

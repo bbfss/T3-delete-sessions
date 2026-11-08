@@ -1,4 +1,6 @@
 import json
+import os
+import shutil
 import sqlite3
 import datetime
 import uuid
@@ -6,11 +8,22 @@ from pathlib import Path
 from contextlib import closing
 
 
+def sqlite_uri(db_path: Path, mode: str = "rw") -> str:
+    resolved = db_path.resolve() if hasattr(db_path, "resolve") else db_path
+    raw = str(resolved)
+    if raw.startswith("\\\\?\\") and not raw.startswith("\\\\?\\UNC\\"):
+        resolved = type(resolved)(raw[4:])
+    return f"{resolved.as_uri()}?mode={mode}"
+
+
+def node_executable() -> str:
+    return os.environ.get("T3_NODE_EXECUTABLE") or shutil.which("node") or "node"
+
 
 def get_db_connection(db_path: Path) -> sqlite3.Connection:
     if not db_path.exists():
         raise FileNotFoundError(f"Database not found at {db_path}")
-    conn = sqlite3.connect(db_path.resolve().as_uri() + "?mode=rw", uri=True)
+    conn = sqlite3.connect(sqlite_uri(db_path, "rw"), uri=True)
     conn.row_factory = sqlite3.Row
     return conn
 

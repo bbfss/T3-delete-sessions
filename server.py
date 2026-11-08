@@ -9,8 +9,26 @@ import sqlite3
 import os
 import shutil
 from pathlib import Path
-from cleaner import clean_family, clean_orphans
+from cleaner import clean_family, clean_orphans, node_executable, sqlite_uri
 from family import plan_cleanup, execute_step
+
+
+def resolve_t3_cli(cli_arg: str, home: Path | None = None) -> str:
+    found = shutil.which(cli_arg)
+    if found:
+        return found
+    if cli_arg == "t3":
+        local_bin = (home or Path.home()) / ".local" / "bin"
+        found_local = shutil.which("t3", path=str(local_bin))
+        if found_local:
+            return found_local
+    return cli_arg
+
+
+def reconfigure_stdio_utf8():
+    for stream, errors in ((sys.stdin, "strict"), (sys.stdout, "strict"), (sys.stderr, "replace")):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors=errors)
 
 
 def tool_definitions():
@@ -68,7 +86,7 @@ def call_tool(name, args, config):
               "native_files": "preserved", "worktrees": "preserved"}
     if config.db:
         identity_file = config.db.parent / 'environment-id'
-        target['environment_id'] = identity_file.read_text().strip() if identity_file.exists() else None
+        target['environment_id'] = identity_file.read_text(encoding='utf-8').strip() if identity_file.exists() else None
     if name == "inspect_target":
         return target
     definition = next((t for t in tool_definitions() if t["name"] == name), None)
@@ -106,13 +124,13 @@ def call_tool(name, args, config):
             commands.extend([{"type": "thread.stop", "threadId": tid},
                              {"type": "thread." + action, "threadId": tid}])
         if commands:
-            proc = subprocess.run(["node", str(Path(__file__).parent / "bin/t3-rpc.js")],
+            proc = subprocess.run([node_executable(), str(Path(__file__).parent / "bin/t3-rpc.js")],
                 input=json.dumps({"cli": config.t3_cli, "baseDir": str(config.db.parent.parent),
                                   "url": config.t3_url, "commands": commands}),
-                text=True, capture_output=True, timeout=40)
+                text=True, encoding="utf-8", capture_output=True, timeout=40)
             if proc.returncode:
                 raise RuntimeError("T3 command failed; some earlier commands may have completed: " + proc.stderr[-1500:])
-            with sqlite3.connect(config.db.resolve().as_uri() + "?mode=ro", uri=True) as conn:
+            with sqlite3.connect(sqlite_uri(config.db, "ro"), uri=True) as conn:
                 for tid in ids:
                     row = conn.execute("SELECT " + ("archived_at" if action == "archive" else "deleted_at") +
                                        " FROM orchestration_v2_projection_threads WHERE thread_id=?", (tid,)).fetchone()
@@ -134,7 +152,7 @@ def handle_rpc(config):
             method = req.get("method")
             if method == "initialize":
                 result = {"protocolVersion": "2024-11-05", "capabilities": {"tools": {}},
-                          "serverInfo": {"name": "t3-delete-sessions-mcp", "version": "1.4.0"}}
+                          "serverInfo": {"name": "t3-delete-sessions-mcp", "version": "1.4.1"}}
             elif method == "tools/list":
                 result = {"tools": tool_definitions()}
             elif method == "ping":
@@ -155,6 +173,7 @@ def handle_rpc(config):
 
 
 if __name__ == "__main__":
+    reconfigure_stdio_utf8()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--db", type=Path, help="Explicit absolute path to the target T3 database")
     parser.add_argument("--allow-offline-writes", action="store_true")
@@ -168,10 +187,10 @@ if __name__ == "__main__":
         if config.db or config.t3_url:
             parser.error("--auto-local cannot be combined with --db or --t3-url")
         base = Path(os.environ.get('T3CODE_HOME', str(Path.home() / '.t3'))).resolve()
-        runtime = json.loads((base / 'userdata/server-runtime.json').read_text())
+        runtime = json.loads((base / 'userdata/server-runtime.json').read_text(encoding='utf-8'))
         config.db = base / 'userdata/statev2.sqlite'
         config.t3_url = runtime['origin']
-        config.t3_cli = shutil.which(config.t3_cli) or config.t3_cli
+        config.t3_cli = resolve_t3_cli(config.t3_cli)
     if config.db:
         if not config.db.is_absolute():
             parser.error("--db must be absolute")
@@ -179,7 +198,7 @@ if __name__ == "__main__":
     if config.call:
         if not config.arguments_file:
             parser.error("--call requires --arguments-file (use - for stdin)")
-        args = json.loads(sys.stdin.read() if config.arguments_file == '-' else Path(config.arguments_file).read_text())
+        args = json.loads(sys.stdin.read() if config.arguments_file == '-' else Path(config.arguments_file).read_text(encoding='utf-8'))
         try:
             print(json.dumps(call_tool(config.call, args, config), ensure_ascii=False))
         except Exception as exc:

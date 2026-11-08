@@ -101,3 +101,51 @@ class CleanerTests(unittest.TestCase):
     def test_non_boolean_dry_run_rejected(self):
         with self.assertRaises(ValueError):
             call_tool('delete_family', dict(self.args, thread_id='parent', dry_run='false'), self.config)
+
+    def test_sqlite_uri_strips_windows_extended_length_prefix(self):
+        from pathlib import PureWindowsPath
+        from cleaner import sqlite_uri
+        win_ext = PureWindowsPath('\\\\?\\C:\\Users\\bbfss\\.t3\\userdata\\statev2.sqlite')
+        self.assertEqual(sqlite_uri(win_ext, 'ro'), 'file:///C:/Users/bbfss/.t3/userdata/statev2.sqlite?mode=ro')
+
+    def test_resolve_t3_cli_falls_back_to_user_local_bin(self):
+        import os
+        from unittest.mock import patch
+        from server import resolve_t3_cli
+        fake_home = self.root / 'home'
+        local_bin = fake_home / '.local' / 'bin'
+        local_bin.mkdir(parents=True)
+        shim = local_bin / ('t3.cmd' if os.name == 'nt' else 't3')
+        shim.write_text('@echo off\n' if os.name == 'nt' else '#!/bin/sh\nexit 0\n', encoding='utf-8')
+        if os.name != 'nt':
+            shim.chmod(0o755)
+        with patch.dict(os.environ, {'PATH': ''}, clear=False):
+            self.assertEqual(Path(resolve_t3_cli('t3', home=fake_home)).resolve(), shim.resolve())
+
+    def test_cli_skips_broken_python3_alias_and_preserves_utf8_rpc(self):
+        import os
+        import shutil
+        node = shutil.which('node')
+        if not node:
+            self.skipTest('node is required')
+        shim_dir = self.root / 'broken-bin'
+        shim_dir.mkdir()
+        if os.name != 'nt':
+            bad_py3 = shim_dir / 'python3'
+            bad_py3.write_text('#!/bin/sh\nexit 1\n', encoding='utf-8')
+            bad_py3.chmod(0o755)
+            good_py = shim_dir / 'python'
+            good_py.symlink_to(sys.executable)
+        env = dict(os.environ)
+        env['PATH'] = str(shim_dir) + os.pathsep + env.get('PATH', '')
+        env.pop('T3_DELETE_SESSIONS_PYTHON', None)
+        with closing(sqlite3.connect(self.db)) as c, c:
+            c.execute("UPDATE orchestration_v2_projection_threads SET title='中文子会话' WHERE thread_id='child'")
+        cli_js = Path(__file__).resolve().parent.parent / 'bin' / 'cli.js'
+        req = {'jsonrpc': '2.0', 'id': 7, 'method': 'tools/call',
+               'params': {'name': 'delete_family', 'arguments': dict(self.args, thread_id='parent', dry_run=True)}}
+        proc = subprocess.run([node, str(cli_js), '--db', str(self.db.resolve())],
+                              input=json.dumps(req, ensure_ascii=False) + '\n',
+                              text=True, encoding='utf-8', capture_output=True, env=env, check=True)
+        payload = json.loads(json.loads(proc.stdout)['result']['content'][0]['text'])
+        self.assertEqual([x['title'] for x in payload['children']], ['grandchild', '中文子会话'])
