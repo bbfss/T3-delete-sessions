@@ -144,7 +144,10 @@ def scan_orphan_sessions(conn: sqlite3.Connection):
 
 def cleanup_provider_native_session(conn: sqlite3.Connection, thread_id: str):
     """
-    Clean up underlying provider files/sessions (Codex, Antigravity, etc.).
+    Clean up underlying provider files/sessions:
+    1. Codex native sessions (via codex delete)
+    2. Antigravity native conversation DBs and brain artifact directories
+    3. Claude / other provider cache/session files
     """
     cur = conn.cursor()
     cur.execute(
@@ -152,18 +155,40 @@ def cleanup_provider_native_session(conn: sqlite3.Connection, thread_id: str):
         (thread_id,)
     )
     rows = cur.fetchall()
+    targets_to_purge = set()
+
     for row in rows:
         driver = row["driver"]
         ptid = row["provider_thread_id"] or ""
-        # If Codex session
+        psid = row["provider_session_id"] or ""
+
+        # 1. Clean Codex
         if driver == "codex":
-            # Extract raw codex uuid if present
             raw_id = ptid.split("native-thread:")[-1] if "native-thread:" in ptid else ptid
             if raw_id:
                 try:
                     subprocess.run(["codex", "delete", raw_id, "--force"], capture_output=True, timeout=5)
                 except Exception:
                     pass
+
+        # 2. Extract UUIDs for local folder cleanup
+        for cand in [thread_id, ptid, psid]:
+            for part in cand.replace("%3A", ":").split(":"):
+                if len(part) == 36 and part.count("-") == 4:
+                    targets_to_purge.add(part)
+
+    # 3. Clean Antigravity conversation DBs and brain folder
+    # Located in ~/.t3/userdata/providers/antigravity/.../{conversations,brain}
+    providers_dir = Path.home() / ".t3" / "userdata" / "providers"
+    for target_uuid in targets_to_purge:
+        for item in providers_dir.glob(f"**/{target_uuid}*"):
+            try:
+                if item.is_dir():
+                    shutil.rmtree(item, ignore_errors=True)
+                else:
+                    item.unlink(missing_ok=True)
+            except Exception:
+                pass
 
 
 def mark_thread_deleted(
