@@ -145,9 +145,18 @@ current thread stays available to collect outcomes and retry blocked branches.
 
 ### Slash command scope
 
-`/deletesessions` and `/deletesubsessions` preserve the invoking thread.
+`/deletechilds` preserves the invoking thread.
 `/deletefamily` includes the invoking thread as the final target, after all remote
 and local descendants have been verified deleted. Deleting the invoking thread
 requires an independent final executor because T3 stops that thread's agent and
 tools. This final self-deletion handoff has not been integration-tested; a missing
 executor is reported as a blocked final step, not as a successful family deletion.
+
+`/deletefathers` preserves the invoking thread and all of its descendants, and
+removes every ancestor and the other branches of that same family. It calls
+`plan_cross_device_cleanup` with `scope: "preserve_current_subtree"`; the protected
+subtree is excluded from dependencies and deletion targets. Missing ancestors
+block planning. Protected side chats that T3 would cascade-delete block execution.
+Surviving threads retain their historical lineage metadata; this does not rewrite
+the T3 database to reparent them. `/deletesessions` and `/deletesubsessions` are
+removed slash commands, not aliases. MCP tool names remain stable.

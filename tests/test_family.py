@@ -71,3 +71,47 @@ class FamilyTests(unittest.TestCase):
         with patch('family.subprocess.run') as run:
             result=execute_step(self.plan,'local',receipts,self.config,'current',False)
         self.assertEqual(result['status'],'already_deleted');run.assert_not_called()
+
+
+class PreserveSubtreeTests(unittest.TestCase):
+    def make_registry(self):
+        edges = [('grand',None),('parent','grand'),('current','parent'),('kept','current'),
+                 ('sibling','parent'),('sibling-child','sibling'),('uncle','grand'),('other',None)]
+        return {'nodes':[{'nodeId':n,'parentNodeId':p,'t3':{'environmentId':'mac','threadId':n}} for n,p in edges]}
+
+    def test_removes_all_ancestors_and_other_branches(self):
+        plan=plan_cleanup(self.make_registry(),'current','mac','current','preserve_current_subtree')
+        self.assertEqual({s['node_id'] for s in plan['steps']},{'grand','parent','sibling','sibling-child','uncle'})
+        self.assertEqual({s['thread_id'] for s in plan['protected']},{'current','kept'})
+        self.assertEqual(plan['steps'][-1]['node_id'],'grand')
+        self.assertEqual({s['node_id'] for s in plan['steps'] if s.get('ancestor')},{'grand','parent'})
+
+    def test_current_root_means_nothing_to_delete(self):
+        plan=plan_cleanup(self.make_registry(),'grand','mac','grand','preserve_current_subtree')
+        self.assertEqual(plan['steps'],[])
+
+    def test_unknown_ancestor_is_not_an_implied_root(self):
+        r=self.make_registry();r['nodes'][0]['parentNodeId']='missing'
+        with self.assertRaisesRegex(ValueError,'Unresolved ancestor'):
+            plan_cleanup(r,'current','mac','current','preserve_current_subtree')
+
+    def test_preserved_remote_descendants_do_not_enter_delete_barrier(self):
+        r=self.make_registry();r['nodes'][3]['t3']['environmentId']='win'
+        plan=plan_cleanup(r,'current','mac','current','preserve_current_subtree')
+        self.assertTrue(all(s['phase']=='local' for s in plan['steps']))
+        self.assertIn({'environment_id':'win','thread_id':'kept'},plan['protected'])
+
+    def test_side_chat_cascade_is_blocked(self):
+        r={'nodes':[{'nodeId':'parent','parentNodeId':None,'t3':{'environmentId':'mac','threadId':'parent'}},
+                    {'nodeId':'current','parentNodeId':'parent','t3':{'environmentId':'mac','threadId':'current'}}]}
+        plan=plan_cleanup(r,'current','mac','current','preserve_current_subtree')
+        with tempfile.TemporaryDirectory() as tmp:
+            db=Path(tmp)/'statev2.sqlite';(db.parent/'environment-id').write_text('mac')
+            c=sqlite3.connect(db)
+            c.executescript('CREATE TABLE orchestration_v2_projection_threads(thread_id TEXT,title TEXT,default_provider TEXT,created_at TEXT,archived_at TEXT,deleted_at TEXT,payload_json TEXT); CREATE TABLE orchestration_v2_projection_subagents(thread_id TEXT,child_thread_id TEXT);')
+            for tid,payload in [('parent',{}),('current',{'lineage':{'parentThreadId':'parent','sideChat':True}})]:
+                c.execute('INSERT INTO orchestration_v2_projection_threads VALUES(?,?,?, ?,NULL,NULL,?)',(tid,tid,'codex','now',json.dumps(payload)))
+            c.commit();c.close()
+            with patch('family.subprocess.run') as run:
+                result=execute_step(plan,'parent',[],SimpleNamespace(db=db,t3_url='http://localhost:1',t3_cli='t3'),'current',False)
+            self.assertEqual(result['status'],'blocked');self.assertIn('side chat',result['reason']);run.assert_not_called()

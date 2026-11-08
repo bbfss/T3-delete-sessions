@@ -1,0 +1,6 @@
+interface:
+  display_name: "deletefathers"
+  short_description: "整棵family只保留当前节点为root的子树"
+  default_prompt: "$deletefathers"
+policy:
+  allow_implicit_invocation: false

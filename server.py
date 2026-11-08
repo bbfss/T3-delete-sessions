@@ -40,7 +40,7 @@ def tool_definitions():
         {"name": "plan_cross_device_cleanup", "description": "Plan current-thread descendants: all remote endpoints must finish before any local deletion. Registry must contain verified T3 identities and parent edges.",
          "inputSchema": {"type": "object", "properties": {
              "registry": {"type": "object"}, "anchor_node_id": {"type": "string"},
-             "current_environment_id": {"type": "string"}, "current_thread_id": {"type": "string"}},
+             "current_environment_id": {"type": "string"}, "current_thread_id": {"type": "string"}, "scope": {"type": "string", "enum": ["descendants_only", "preserve_current_subtree"], "default": "descendants_only"}},
              "required": ["registry", "anchor_node_id", "current_environment_id", "current_thread_id"]}},
         {"name": "execute_cleanup_step", "description": "Execute one planned endpoint on its owning machine. Remote success receipts are mandatory before local deletion. Current coordinator and worker are protected. Defaults to preview.",
          "inputSchema": {"type": "object", "properties": {
@@ -54,7 +54,7 @@ def tool_definitions():
 
 def call_tool(name, args, config):
     if name == "plan_cross_device_cleanup":
-        return plan_cleanup(args['registry'], args['anchor_node_id'], args['current_environment_id'], args['current_thread_id'])
+        return plan_cleanup(args['registry'], args['anchor_node_id'], args['current_environment_id'], args['current_thread_id'], args.get('scope', 'descendants_only'))
     if name == "execute_cleanup_step":
         if not config.db or not args.get('worker_thread_id'):
             raise ValueError('Configured database and exact worker_thread_id required')
@@ -134,7 +134,7 @@ def handle_rpc(config):
             method = req.get("method")
             if method == "initialize":
                 result = {"protocolVersion": "2024-11-05", "capabilities": {"tools": {}},
-                          "serverInfo": {"name": "t3-delete-sessions-mcp", "version": "1.3.0"}}
+                          "serverInfo": {"name": "t3-delete-sessions-mcp", "version": "1.4.0"}}
             elif method == "tools/list":
                 result = {"tools": tool_definitions()}
             elif method == "ping":

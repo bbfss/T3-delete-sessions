@@ -1,0 +1,6 @@
+interface:
+  display_name: "deletechilds"
+  short_description: "删除全部后代，保留当前会话"
+  default_prompt: "$deletechilds"
+policy:
+  allow_implicit_invocation: false

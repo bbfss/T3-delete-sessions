@@ -78,3 +78,22 @@ conflicts, and already-deleted retries. The four slash skills pass skill validat
 Windows/VPS installation and a full model-driven delegated cleanup have not
 been exercised by this two-Linux-machine test. Workers need their own local
 runtime and existing authorized T3 access; credentials are not copied.
+
+## Preserve current subtree, version 1.4.0
+
+A fresh seven-node test on T3 0.1.7 used official CLI creation and native
+`delegated_task.request` edges: grandparent, parent, current, current's child,
+a sibling, an uncle and one unrelated thread. The new
+`scope: preserve_current_subtree` plan deleted the four ancestors/other-branch
+nodes. Current, its child and the unrelated thread remained readable through
+the official `t3 thread show` interface after deletion. SQL deletion timestamps
+matched the plan. Model generation was not verified.
+
+Ancestor steps send only the precise official `thread.delete` command, without
+recursive task cancellation. Protected side-chat children are blocked because
+T3 cascades their parent's deletion; this guard has a regression test. The
+plugin preserves historical lineage metadata rather than rewriting T3 records.
+All 24 regression tests passed, including full ancestor scope, unrelated trees,
+missing ancestor rejection, protected remote descendants, and side-chat blocking.
+The test server was stopped after completion. Report:
+`/data/home/t3-cross-test/preserve-subtree-report.json` on the sandbox.
