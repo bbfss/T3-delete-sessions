@@ -142,3 +142,12 @@ npx -y github:bbfss/T3-delete-sessions --auto-local --call inspect_target --argu
 planning/execution. The Node/Python/T3 CLI prerequisites apply on every worker.
 Existing T3 links and authorization are required for delegated workers. The
 current thread stays available to collect outcomes and retry blocked branches.
+
+### Slash command scope
+
+`/deletesessions` and `/deletesubsessions` preserve the invoking thread.
+`/deletefamily` includes the invoking thread as the final target, after all remote
+and local descendants have been verified deleted. Deleting the invoking thread
+requires an independent final executor because T3 stops that thread's agent and
+tools. This final self-deletion handoff has not been integration-tested; a missing
+executor is reported as a blocked final step, not as a successful family deletion.
