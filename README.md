@@ -107,3 +107,38 @@ Tests use temporary synthetic databases and never open the user's T3 database.
 ## License
 
 MIT
+
+## Cross-device cleanup
+
+Version 1.3 adds `plan_cross_device_cleanup` and `execute_cleanup_step`.
+The slash skills in `skills/` coordinate T3 delegates on the owning machines;
+the MCP does not silently forward local calls to another host.
+
+`plan_cross_device_cleanup` takes the verified session registry (`nodes`, each
+with `nodeId`, `parentNodeId` and `t3.environmentId/threadId`), the current
+`anchor_node_id`, `current_environment_id` and `current_thread_id`. It excludes
+the current thread and orders every remote endpoint before local endpoints.
+A remote-to-local nesting that conflicts with this order is rejected.
+
+Each owning environment executes one step with `execute_cleanup_step`, passing
+the plan, `node_id`, actual success `receipts`, its `worker_thread_id`, and
+`dry_run`. Receipts are trusted orchestration inputs: the coordinator must verify
+and persist the worker's results, never manufacture a success receipt. The tool
+checks environment identity against T3's environment-id file, protects the
+coordinator/worker, and requires success receipts for **all** remote steps
+before a local deletion can proceed. Failure, offline state or missing receipts
+leaves local deletion blocked. Live local descendants also block their parent's
+deletion, so the registry must be complete and refreshed when needed.
+
+For an agent running on the owning host, `--auto-local` reads that host's running
+T3 metadata from `T3CODE_HOME` or `~/.t3`. It infers no thread IDs. This avoids
+copying Mac paths to Windows/Linux. A tool can also run once without reconnecting MCP:
+
+```sh
+npx -y github:bbfss/T3-delete-sessions --auto-local --call inspect_target --arguments-file inspect.json
+```
+
+`inspect.json` contains `{}`. Use the appropriate tool name and argument file for
+planning/execution. The Node/Python/T3 CLI prerequisites apply on every worker.
+Existing T3 links and authorization are required for delegated workers. The
+current thread stays available to collect outcomes and retry blocked branches.

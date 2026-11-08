@@ -54,3 +54,27 @@ The result is retained at
 `/data/t3-cleaner-real-test-20261108/online-test-report.json` in the sandbox.
 The test server was stopped after completion. This extends the earlier offline
 single-thread test with a real three-level T3 delegation family.
+
+## Remote-first barrier, version 1.3.0
+
+Validated on two separate InstaBox Linux machines, each running its own T3
+0.1.7 installation and database. Official T3 CLI calls created disposable
+coordinator and target threads on both machines. An explicit test registry
+mapped the two target endpoints into a family; this tested the cross-machine
+plan/receipt workflow, not native T3 peer delegation discovery.
+
+1. A local execution request with no remote receipt returned `blocked` and
+   left its target undeleted.
+2. The remote machine executed its step through official T3 RPC and returned
+   `deleted`, verified against that machine's database.
+3. Passing that actual receipt to the local machine allowed its step to finish
+   with `deleted`.
+4. Both coordinator threads and sentinel course files remained intact. Both
+   test T3 servers were stopped afterward.
+
+The 19 regression tests include failure/preview/wrong-environment receipts,
+protected current threads, unresolved endpoint IDs, remote-to-local ordering
+conflicts, and already-deleted retries. The four slash skills pass skill validation.
+Windows/VPS installation and a full model-driven delegated cleanup have not
+been exercised by this two-Linux-machine test. Workers need their own local
+runtime and existing authorized T3 access; credentials are not copied.
