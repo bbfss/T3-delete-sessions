@@ -311,3 +311,72 @@ test("side chat cascade is blocked", async (t) => {
   assert.match(result.reason, /side chat/);
   assert.equal(called, false);
 });
+
+test("executeStep schedules detached worker self-cleanup only after final remote step on that environment", async (t) => {
+  const env = makeTempEnv("win");
+  t.after(env.cleanup);
+
+  withDatabase(env.db, { readOnly: false }, (conn) => {
+    conn.exec(`
+      CREATE TABLE orchestration_v2_projection_threads(
+        thread_id TEXT,
+        title TEXT,
+        default_provider TEXT,
+        created_at TEXT,
+        archived_at TEXT,
+        deleted_at TEXT,
+        payload_json TEXT
+      );
+      CREATE TABLE orchestration_v2_projection_provider_threads(
+        thread_id TEXT,
+        payload_json TEXT
+      );
+      INSERT INTO orchestration_v2_projection_threads VALUES ('rem-1', 'R1', 'codex', 'now', NULL, NULL, '{}');
+      INSERT INTO orchestration_v2_projection_threads VALUES ('rem-2', 'R2', 'codex', 'now', NULL, NULL, '{}');
+    `);
+  });
+
+  const registry = {
+    nodes: [
+      { nodeId: "root", parentNodeId: null, t3: { environmentId: "mac", threadId: "root" } },
+      { nodeId: "r1", parentNodeId: "root", t3: { environmentId: "win", threadId: "rem-1" } },
+      { nodeId: "r2", parentNodeId: "root", t3: { environmentId: "win", threadId: "rem-2" } },
+    ],
+  };
+  const plan = planCleanup(registry, "root", "mac", "root");
+
+  let spawnedWorkerPayloads = [];
+  const mockSpawnSelfDelete = (payload) => {
+    spawnedWorkerPayloads.push(payload);
+    return { pid: 99999, receipt_path: "/tmp/worker-self-del.json" };
+  };
+  const mockDispatch = async ({ commands }) => {
+    withDatabase(env.db, { readOnly: false }, (conn) => {
+      for (const cmd of commands) {
+        if (cmd.type === "thread.delete") {
+          conn
+            .prepare("UPDATE orchestration_v2_projection_threads SET deleted_at = 'now' WHERE thread_id = ?")
+            .run(cmd.threadId);
+        }
+      }
+    });
+  };
+
+  const step1 = await executeStep(plan, "r1", [], env.config, "worker-thread-1", false, {
+    dispatchFn: mockDispatch,
+    spawnSelfDeleteFn: mockSpawnSelfDelete,
+  });
+  assert.equal(step1.status, "deleted");
+  assert.equal(step1.workerSelfCleanup, undefined);
+  assert.equal(spawnedWorkerPayloads.length, 0);
+
+  const step2 = await executeStep(plan, "r2", [step1], env.config, "worker-thread-1", false, {
+    dispatchFn: mockDispatch,
+    spawnSelfDeleteFn: mockSpawnSelfDelete,
+  });
+  assert.equal(step2.status, "deleted");
+  assert.equal(spawnedWorkerPayloads.length, 1);
+  assert.equal(spawnedWorkerPayloads[0].thread_id, "worker-thread-1");
+  assert.equal(step2.workerSelfCleanup.pid, 99999);
+});
+

@@ -20,7 +20,7 @@ import {
 import { normalizeDbPath, sameDbPath, withDatabase } from "./sqlite.js";
 import { dispatchT3Commands } from "./ws-rpc.js";
 
-export const SERVER_VERSION = "1.9.0";
+export const SERVER_VERSION = "1.9.1";
 
 export function toolDefinitions() {
   const common = {
@@ -170,7 +170,7 @@ export function toolDefinitions() {
     {
       name: "execute_cleanup_step",
       description:
-        "Execute one planned endpoint on its owning machine (delete or archive per plan.action). Remote success receipts are mandatory before local execution. Current coordinator and worker are protected. Defaults to preview.",
+        "Execute one planned endpoint on its owning machine (delete or archive per plan.action). Remote success receipts are mandatory before local execution. Current coordinator and worker are protected during step execution; when the final remote step on this environment completes, a detached background worker is automatically scheduled to clean up worker_thread_id (unless self_cleanup_worker=false). Defaults to preview.",
       inputSchema: {
         type: "object",
         properties: {
@@ -180,6 +180,7 @@ export function toolDefinitions() {
           worker_thread_id: { type: "string" },
           dry_run: { type: "boolean", default: true },
           confirm_remove_git_worktrees: { type: "boolean", default: false },
+          self_cleanup_worker: { type: "boolean", default: true },
         },
         required: ["plan", "node_id", "receipts", "worker_thread_id"],
       },
@@ -297,6 +298,9 @@ export async function callTool(
       {
         dispatchFn,
         confirmRemoveGitWorktrees: Boolean(args.confirm_remove_git_worktrees),
+        selfCleanupWorker:
+          args.self_cleanup_worker === undefined ? true : Boolean(args.self_cleanup_worker),
+        spawnSelfDeleteFn,
       }
     );
   }

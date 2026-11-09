@@ -1,11 +1,13 @@
 import { nativeEndpoints, deleteNativeEndpoints } from "./native.js";
 import { readFileSync } from "node:fs";
+import os from "node:os";
 import { dirname, join } from "node:path";
 import {
   findDescendantTree,
   inspectWorktreesForThreads,
   removeDeletedScratch,
 } from "./cleaner.js";
+import { spawnDetachedSelfDelete } from "./self-delete.js";
 import { withDatabase } from "./sqlite.js";
 import { dispatchT3Commands } from "./ws-rpc.js";
 
@@ -183,7 +185,13 @@ export async function executeStep(
   config,
   workerThreadId,
   dryRun = true,
-  { dispatchFn = dispatchT3Commands, confirmRemoveGitWorktrees = false } = {}
+  {
+    dispatchFn = dispatchT3Commands,
+    confirmRemoveGitWorktrees = false,
+    selfCleanupWorker = true,
+    delayMs = 2500,
+    spawnSelfDeleteFn = spawnDetachedSelfDelete,
+  } = {}
 ) {
   const modeAction = plan?.action ?? "delete";
   if (
@@ -349,6 +357,50 @@ export async function executeStep(
     ...new Set([...autoExpandedChildIds, ...previouslyDeletedChildIds, tid]),
   ];
 
+  const explicitlyProtectedPairs = new Set(
+    plan.protected.map((p) => `${p.environment_id}\0${p.thread_id}`)
+  );
+
+  function maybeScheduleWorkerSelfCleanup(stepResult) {
+    if (
+      dryRun ||
+      !selfCleanupWorker ||
+      typeof spawnSelfDeleteFn !== "function" ||
+      step.phase !== "remote" ||
+      !workerThreadId ||
+      explicitlyProtectedPairs.has(`${env}\0${workerThreadId}`) ||
+      !okStatuses.has(stepResult?.status)
+    ) {
+      return stepResult;
+    }
+
+    const otherEnvRemoteSteps = [...steps.values()].filter(
+      (s) =>
+        s.phase === "remote" &&
+        s.environment_id === env &&
+        s.node_id !== nodeId
+    );
+    if (!otherEnvRemoteSteps.every((s) => confirmed(s.node_id))) {
+      return stepResult;
+    }
+
+    try {
+      stepResult.workerSelfCleanup = spawnSelfDeleteFn({
+        action: modeAction,
+        target_host: os.hostname(),
+        db_path: dbPath,
+        thread_id: workerThreadId,
+        delay_ms: delayMs,
+        confirm_remove_git_worktrees: confirmRemoveGitWorktrees,
+        remote_receipts: [],
+        config: { db: dbPath, t3Url, t3Cli },
+      });
+    } catch (err) {
+      stepResult.workerSelfCleanupError = String(err?.message || err);
+    }
+    return stepResult;
+  }
+
   if (precheck) {
     if (!dryRun && modeAction === "delete" && precheck.status === "already_deleted") {
       precheck.native = await deleteNativeEndpoints(
@@ -365,7 +417,7 @@ export async function executeStep(
         precheck.status = "incomplete_native";
       }
     }
-    return precheck;
+    return maybeScheduleWorkerSelfCleanup(precheck);
   }
 
   if (dryRun) {
@@ -473,5 +525,5 @@ export async function executeStep(
       verified.status = "incomplete_native";
     }
   }
-  return verified;
+  return maybeScheduleWorkerSelfCleanup(verified);
 }
