@@ -141,7 +141,7 @@ test("deleted retry is verified without commands", async (t) => {
   t.after(env.cleanup);
   withDatabase(env.db, { readOnly: false }, (conn) => {
     conn.exec(
-      "CREATE TABLE orchestration_v2_projection_threads(thread_id TEXT, deleted_at TEXT); INSERT INTO orchestration_v2_projection_threads VALUES('local-child', 'done');"
+      "CREATE TABLE orchestration_v2_projection_threads(thread_id TEXT, deleted_at TEXT, payload_json TEXT); INSERT INTO orchestration_v2_projection_threads VALUES('local-child', 'done', '{}');"
     );
   });
   const plan = planCleanup(makeRegistry(), "root", "mac", "current");

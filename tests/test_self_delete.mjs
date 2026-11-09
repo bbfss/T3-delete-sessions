@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { realpathSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -8,7 +8,7 @@ import { callTool, parseCliArgs } from "../src/server.js";
 import { normalizeDbPath, withDatabase } from "../src/sqlite.js";
 
 function createSelfDeleteFixture() {
-  const root = mkdtempSync(join(os.tmpdir(), "t3-self-del-"));
+  const root = realpathSync(mkdtempSync(join(os.tmpdir(), "t3-self-del-")));
   mkdirSync(join(root, "userdata"), { recursive: true });
   const db = normalizeDbPath(join(root, "userdata", "statev2.sqlite"));
   writeFileSync(db, "");
@@ -303,3 +303,29 @@ test("symmetric archive tools (archive_subsessions, schedule_archive_family, and
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+for (const tool of ["delete_family", "delete_subsessions", "delete_orphans", "archive_family"]) {
+  test(`${tool} cleans only deleted scratch directories`, async () => {
+    const { root, db } = createSelfDeleteFixture();
+    try {
+      withDatabase(db, { readOnly: false }, conn => {
+        for (const id of ["root-1", "child-1"]) {
+          const dir = join(root, "scratch", id);
+          mkdirSync(join(dir, ".agents", "skills"), { recursive: true });
+          conn.prepare("UPDATE orchestration_v2_projection_threads SET payload_json = json_set(payload_json, '$.worktreePath', ?) WHERE thread_id = ?").run(dir, id);
+        }
+        if (tool === "delete_orphans") conn.exec("UPDATE orchestration_v2_projection_threads SET deleted_at='before' WHERE thread_id='root-1'");
+      });
+      await callTool(tool, { target_host: os.hostname(), db_path: db, ...(tool.endsWith("family") ? { thread_id: "root-1", keep_parent: false } : tool.endsWith("subsessions") ? { thread_id: "root-1" } : {}), dry_run: false }, { db, t3Url: "http://localhost:3773" }, {
+        dispatchFn: async ({ commands }) => withDatabase(db, { readOnly: false }, conn => {
+          for (const cmd of commands) {
+            const col = cmd.type === "thread.delete" ? "deleted_at" : cmd.type === "thread.archive" ? "archived_at" : null;
+            if (col) conn.prepare(`UPDATE orchestration_v2_projection_threads SET ${col}='now' WHERE thread_id=?`).run(cmd.threadId);
+          }
+        })
+      });
+      assert.equal(existsSync(join(root, "scratch", "child-1")), tool === "archive_family");
+      assert.equal(existsSync(join(root, "scratch", "root-1")), tool !== "delete_family");
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+}

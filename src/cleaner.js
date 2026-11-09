@@ -1,3 +1,5 @@
+import { existsSync, rmSync, lstatSync } from "node:fs";
+import { dirname, resolve, sep, join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { withDatabase, withTransaction } from "./sqlite.js";
 
@@ -216,5 +218,34 @@ export function cleanFamily(
       childrenCount: processedChildren.length,
       children: processedChildren,
     };
+  });
+}
+
+// Remove only T3-owned scratch directories after confirmed online deletion.
+export function removeDeletedScratch(dbPath, ids) {
+  const root = resolve(dirname(dirname(dbPath)), "scratch");
+  return withDatabase(dbPath, { readOnly: true }, (db) => {
+    const rows = db.prepare("SELECT thread_id, deleted_at, payload_json FROM orchestration_v2_projection_threads").all();
+    const paths = rows.map(row => ({ ...row, path: JSON.parse(row.payload_json).worktreePath }));
+    const results = [];
+    for (const row of paths.filter(row => ids.includes(row.thread_id) && row.deleted_at)) {
+      if (!row.path || dirname(resolve(row.path)) !== root) continue;
+      const directory = resolve(row.path);
+      if (paths.some(other => !other.deleted_at && other.path &&
+        (resolve(other.path) === directory || resolve(other.path).startsWith(directory + sep)))) {
+        results.push({ path: directory, status: "retained_shared" });
+        continue;
+      }
+      if (existsSync(join(directory, ".git"))) {
+        results.push({ path: directory, status: "retained_git" });
+        continue;
+      }
+      if (existsSync(directory)) {
+        if (lstatSync(directory).isSymbolicLink()) continue;
+        rmSync(directory, { recursive: true, force: true });
+      }
+      results.push({ path: directory, status: "removed" });
+    }
+    return results;
   });
 }

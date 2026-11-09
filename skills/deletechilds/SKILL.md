@@ -7,7 +7,7 @@ description: 显式 /deletechilds 或 $deletechilds 清理当前会话的全部�
 
 只有用户实际发送 `/deletechilds`、`$deletechilds`（T3 斜杠菜单选择 Skill 后自动插入 `$deletechilds`）或对应 Skill 才执行。讨论、引用、自动登记不授权删除。不再调用旧的 `t3-clean-sessions --current`。
 
-使用 T3-delete-sessions 1.7.0+（纯 Node.js 零外部依赖）。若当前会话无跨设备远端后代（本机 `session-family-cleanup` 无远端登记且未发起过远端委派），直接走单机快路径：用 `t3_thread_list` 核实真实 `currentThreadId`，调用 `inspect_target` 与 `delete_subsessions(target_host=..., db_path=..., thread_id=currentThreadId, dry_run=true -> false)` 秒级完成（当前根会话保留）。若未挂载 MCP，可在目标机器以单次工具模式调用：
+使用 T3-delete-sessions 1.8.0+（纯 Node.js 零外部依赖）。若当前会话无跨设备远端后代（本机 `session-family-cleanup` 无远端登记且未发起过远端委派），直接走单机快路径：用 `t3_thread_list` 核实真实 `currentThreadId`，调用 `inspect_target` 与 `delete_subsessions(target_host=..., db_path=..., thread_id=currentThreadId, dry_run=true -> false)` 秒级完成（当前根会话保留）。若未挂载 MCP，可在目标机器以单次工具模式调用：
 
 ```sh
 npx -y github:bbfss/T3-delete-sessions --auto-local --call inspect_target --arguments-file request.json
@@ -30,4 +30,8 @@ request.json 为对应工具参数对象；inspect_target 使用 `{}`。其他�
 8. worker回传完整JSON回执；协调者在所属环境用官方读接口核验。只有deleted/already_deleted且环境、会话、node_id一致的回执才计为完成。保存实际回执，不能自己补写成功。远端全部成功之前禁止开始任何本地删除；failed/blocked/unverified/离线保留为pending，相关父入口保留。
 9. 原始plan与receipts保存在会话历史之外，便于重试。已删节点再次查询可返回already_deleted。清理worker保持可用并回报，不自删；需要清理worker时另一次显式调用处理。
 
-报告各设备成功/受阻数量。T3删除是会话记录状态变化，插件保留原生provider历史和项目/worktree文件；不得宣称物理清空。只核验配置不能算执行成功。
+报告各设备成功/受阻数量。T3删除是会话记录状态变化，插件保留原生provider历史和外部项目/worktree文件；不得宣称物理清空。只核验配置不能算执行成功。
+
+## 会话工作目录
+
+使用 T3-delete-sessions 1.8.0+。所有在线删除入口在核实删除成功后，完整移除目标会话独占的 T3 scratch 一级目录（含隐藏文件及目录）。仍有未删除会话使用该目录或其子目录时保留并报告 retained_shared；外部项目、Git worktree、原生 provider 历史保留。归档、预览和离线快照不删除目录。跨设备在目录所属机器执行并在回执返回 scratchDirectories。

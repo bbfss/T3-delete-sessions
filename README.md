@@ -87,7 +87,7 @@ the flag does not detect or stop T3. Use T3's official interface for live sessio
 Updates mark the selected projection rows and append local database event records
 in one transaction. This is **not an official T3 API call**, does not broadcast to
 a live UI, does not stop agents and does not physically erase conversation data.
-Provider-native sessions, artifacts, scratch directories and worktrees are preserved.
+Online deletion removes each deleted thread’s exclusive T3 scratch directory, including hidden files and the directory itself. Directories still used by undeleted threads, external projects, Git worktrees and provider-native history are preserved. Archive, preview and offline operations preserve files. This applies to family, descendants, orphans and cross-device ancestor pruning.
 A preview reports `parentDeleted: false`; successful writes report
 `updated_offline_database`, not physical deletion.
 

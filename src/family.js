@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { findDescendantTree } from "./cleaner.js";
+import { findDescendantTree, removeDeletedScratch } from "./cleaner.js";
 import { withDatabase } from "./sqlite.js";
 import { dispatchT3Commands } from "./ws-rpc.js";
 
@@ -316,6 +316,8 @@ export async function executeStep(
   });
 
   if (precheck) {
+    if (!dryRun && modeAction === "delete" && precheck.status === "already_deleted")
+      precheck.scratchDirectories = removeDeletedScratch(dbPath, [tid]);
     return precheck;
   }
   if (dryRun) {
@@ -380,6 +382,7 @@ export async function executeStep(
     return {
       ...step,
       action: modeAction,
+      ...(ok && modeAction === "delete" ? { scratchDirectories: removeDeletedScratch(dbPath, [tid]) } : {}),
       status: ok ? (modeAction === "archive" ? "archived" : "deleted") : "unverified",
     };
   });

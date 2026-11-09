@@ -3,7 +3,7 @@ import os from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
 import readline from "node:readline";
 import { resolveT3Cli } from "../bin/platform.js";
-import { cleanFamily, cleanOrphans } from "./cleaner.js";
+import { cleanFamily, cleanOrphans, removeDeletedScratch } from "./cleaner.js";
 import { executeStep, planCleanup } from "./family.js";
 import {
   defaultCleanupStateDir,
@@ -13,7 +13,7 @@ import {
 import { normalizeDbPath, sameDbPath, withDatabase } from "./sqlite.js";
 import { dispatchT3Commands } from "./ws-rpc.js";
 
-export const SERVER_VERSION = "1.7.0";
+export const SERVER_VERSION = "1.8.0";
 
 export function toolDefinitions() {
   const common = {
@@ -74,7 +74,7 @@ export function toolDefinitions() {
       name,
       description: isArchiveTool
         ? "Preview by default. In online mode, stop and archive selected threads (recoverable) through T3 official commands. Offline mode requires explicit opt-in."
-        : "Preview by default. In online mode, stop and clean selected threads through T3 official commands. Offline mode requires explicit opt-in. Preserves provider files and worktrees.",
+        : "Preview by default. In online mode, stop and clean selected threads through T3 official commands. Offline mode requires explicit opt-in. Removes exclusive T3 scratch directories after online deletion; preserves provider files and external worktrees.",
       inputSchema: {
         type: "object",
         properties,
@@ -394,6 +394,7 @@ export async function callTool(
       });
     }
 
+    if (action === "delete") result.scratchDirectories = removeDeletedScratch(dbConfigPath, ids);
     result.status = "completed_via_t3";
     result.parentDeleted = Boolean(result.parentSelected) && action === "delete";
     result.parentArchived = Boolean(result.parentSelected) && action === "archive";
