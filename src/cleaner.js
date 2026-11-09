@@ -535,7 +535,12 @@ function removeGitLinkedWorktree(directory) {
     }
   }
   if (existsSync(directory)) {
-    rmSync(directory, { recursive: true, force: true });
+    rmSync(directory, {
+      recursive: true,
+      force: true,
+      maxRetries: 5,
+      retryDelay: 250,
+    });
   }
 }
 
@@ -770,25 +775,44 @@ export function removeDeletedScratch(
           });
           continue;
         }
+        let removeErr = null;
         if (existsSync(directory)) {
           if (lstatSync(directory).isSymbolicLink()) continue;
-          removeGitLinkedWorktree(directory);
+          try {
+            removeGitLinkedWorktree(directory);
+          } catch (err) {
+            removeErr = err?.message ?? String(err);
+          }
         }
-        results.push({
+        const entry = {
           path: directory,
           status: existsSync(directory) ? "failed" : "removed",
-        });
+        };
+        if (removeErr && entry.status === "failed") entry.reason = removeErr;
+        results.push(entry);
         continue;
       }
 
+      let removeErr = null;
       if (existsSync(directory)) {
         if (lstatSync(directory).isSymbolicLink()) continue;
-        rmSync(directory, { recursive: true, force: true });
+        try {
+          rmSync(directory, {
+            recursive: true,
+            force: true,
+            maxRetries: 5,
+            retryDelay: 250,
+          });
+        } catch (err) {
+          removeErr = err?.message ?? String(err);
+        }
       }
-      results.push({
+      const entry = {
         path: directory,
         status: existsSync(directory) ? "failed" : "removed",
-      });
+      };
+      if (removeErr && entry.status === "failed") entry.reason = removeErr;
+      results.push(entry);
     }
     return results;
   });
