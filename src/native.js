@@ -182,7 +182,12 @@ export function nativeEndpoints(dbPath, ids) {
           endpoint.protectedNativeIds = [...protectedCodexNativeIds];
         }
 
-        if (!nativeId || r.nativeThreadRef?.strength !== "strong") {
+        if (!nativeId) {
+          Object.assign(endpoint, {
+            status: "no_native_session",
+            reason: "Provider thread ended before binding a native conversation ID",
+          });
+        } else if (r.nativeThreadRef?.strength !== "strong") {
           Object.assign(endpoint, {
             status: "unverified",
             reason: "No strong native identity",
