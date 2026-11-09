@@ -194,6 +194,103 @@ function findMatchingFilesRecursive(dirPath, needle) {
   return hits;
 }
 
+function hasTable(db, tableName) {
+  return Boolean(
+    db
+      .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name = ?")
+      .get(tableName)
+  );
+}
+
+function purgeCodexLocalStorage(nativeId, codexHome) {
+  if (!codexHome || !existsSync(codexHome)) return;
+  let entries = [];
+  try {
+    entries = readdirSync(codexHome);
+  } catch {
+    return;
+  }
+
+  const rolloutPaths = new Set();
+
+  for (const name of entries) {
+    if (!/\.sqlite$/i.test(name)) continue;
+    const sqlitePath = join(codexHome, name);
+    try {
+      withDatabase(sqlitePath, { readOnly: false }, (db) => {
+        db.exec("PRAGMA busy_timeout = 5000;");
+        if (hasTable(db, "threads")) {
+          const rows = db
+            .prepare("SELECT rollout_path FROM threads WHERE id = ?")
+            .all(nativeId);
+          for (const r of rows) {
+            if (r?.rollout_path) rolloutPaths.add(r.rollout_path);
+          }
+        }
+        db.exec("BEGIN IMMEDIATE;");
+        try {
+          for (const tbl of [
+            "logs",
+            "thread_dynamic_tools",
+            "thread_attachments",
+            "guardian_review_feedback",
+            "thread_read_receipts",
+            "thread_items",
+            "thread_turns",
+            "thread_realtime_items",
+            "thread_history_projection_state",
+            "thread_goal_continuation_deferrals",
+            "thread_goals",
+            "queued_items",
+            "queued_thread_revisions",
+          ]) {
+            if (hasTable(db, tbl)) {
+              db.prepare(`DELETE FROM "${tbl}" WHERE thread_id = ?`).run(nativeId);
+            }
+          }
+          if (hasTable(db, "thread_spawn_edges")) {
+            db.prepare(
+              "DELETE FROM thread_spawn_edges WHERE parent_thread_id = ? OR child_thread_id = ?"
+            ).run(nativeId, nativeId);
+          }
+          if (hasTable(db, "threads")) {
+            db.prepare("DELETE FROM threads WHERE id = ?").run(nativeId);
+          }
+          db.exec("COMMIT;");
+        } catch (err) {
+          try {
+            db.exec("ROLLBACK;");
+          } catch {
+            // Ignore rollback error
+          }
+          throw err;
+        }
+      });
+    } catch {
+      // Best-effort per-db cleanup; verification step checks final state.
+    }
+  }
+
+  for (const p of rolloutPaths) {
+    try {
+      rmSync(p, { force: true });
+    } catch {
+      // Verified below
+    }
+  }
+
+  for (const sub of ["sessions", "archived_sessions"]) {
+    const hits = findMatchingFilesRecursive(join(codexHome, sub), nativeId);
+    for (const hit of hits) {
+      try {
+        rmSync(hit, { force: true });
+      } catch {
+        // Verified below
+      }
+    }
+  }
+}
+
 function verifyCodexLocalStorageGone(nativeId, codexHome) {
   if (!codexHome || !existsSync(codexHome)) {
     return { gone: true };
@@ -210,10 +307,7 @@ function verifyCodexLocalStorageGone(nativeId, codexHome) {
     const sqlitePath = join(codexHome, name);
     try {
       const count = withDatabase(sqlitePath, { readOnly: true }, (db) => {
-        const hasThreads = db
-          .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='threads'")
-          .get();
-        if (!hasThreads) return 0;
+        if (!hasTable(db, "threads")) return 0;
         const row = db
           .prepare("SELECT count(*) AS c FROM threads WHERE id = ?")
           .get(nativeId);
@@ -244,8 +338,8 @@ export async function deleteCodex(
     env = process.env,
     platform = process.platform,
     homedir = os.homedir(),
-    maxAttempts = 8,
-    retryDelayMs = 600,
+    maxAttempts = 2,
+    retryDelayMs = 250,
   } = {}
 ) {
   if (!CANONICAL_UUID_RE.test(nativeId)) {
@@ -338,21 +432,27 @@ export async function deleteCodex(
         break;
       }
       lastErr = errMsg;
-      if (/active writer|locked|busy/i.test(errMsg) && attempt < maxAttempts) {
-        try {
-          await call("thread/unsubscribe", { threadId: nativeId });
-        } catch {
-          // Ignore unsubscribe error on separate stdio instance.
+      if (/active writer|locked|busy/i.test(errMsg)) {
+        if (attempt < maxAttempts) {
+          await sleep(retryDelayMs);
+          continue;
         }
-        try {
-          await call("thread/archive", { threadId: nativeId });
-        } catch {
-          // Best-effort release hint before backoff retry.
-        }
-        await sleep(retryDelayMs);
-        continue;
+        break;
       }
       return { status: "failed", reason: errMsg };
+    }
+
+    if (lastErr && /active writer|locked|busy/i.test(lastErr)) {
+      purgeCodexLocalStorage(nativeId, codexHome);
+      const diskAfterPurge = verifyCodexLocalStorageGone(nativeId, codexHome);
+      if (diskAfterPurge.gone) {
+        return {
+          status: "deleted",
+          verification:
+            "Purged directly from local Codex SQLite and rollout dirs while app-server writer lock awaits idle eviction",
+        };
+      }
+      return { status: "failed", reason: `${lastErr} (${diskAfterPurge.detail})` };
     }
 
     if (lastErr) {
@@ -369,8 +469,8 @@ export async function deleteCodex(
       /no rollout found|not found|thread not loaded/i.test(message);
 
     let diskCheck = verifyCodexLocalStorageGone(nativeId, codexHome);
-    for (let i = 0; !diskCheck.gone && i < 4; i += 1) {
-      await sleep(150);
+    if (!diskCheck.gone) {
+      purgeCodexLocalStorage(nativeId, codexHome);
       diskCheck = verifyCodexLocalStorageGone(nativeId, codexHome);
     }
 
