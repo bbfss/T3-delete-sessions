@@ -275,21 +275,46 @@ export async function dispatchT3Commands({
   url,
   commands,
   timeoutMs = 30000,
-  issueToken = (c, dir) =>
-    execT3Cli(c, [
-      "auth",
-      "session",
-      "issue",
-      "--base-dir",
-      dir,
-      "--ttl",
-      "5m",
-      "--token-only",
-    ]).trim(),
+  issueToken = null,
 }) {
   if (!commands || commands.length === 0) {
     return [];
   }
-  const token = issueToken(cli, baseDir);
-  return dispatchT3CommandsOverWs({ url, token, commands, timeoutMs });
+  if (issueToken) {
+    const token = issueToken(cli, baseDir);
+    return dispatchT3CommandsOverWs({ url, token, commands, timeoutMs });
+  }
+  let sessionId = null;
+  let token = null;
+  const raw = execT3Cli(cli, [
+    "auth",
+    "session",
+    "issue",
+    "--base-dir",
+    baseDir,
+    "--ttl",
+    "5m",
+    "--json",
+  ]).trim();
+  try {
+    const parsed = JSON.parse(raw);
+    sessionId = parsed?.sessionId || null;
+    token = parsed?.token || null;
+  } catch {
+    token = raw;
+  }
+  if (!token) {
+    throw new Error("Failed to issue T3 bearer session token");
+  }
+  try {
+    return await dispatchT3CommandsOverWs({ url, token, commands, timeoutMs });
+  } finally {
+    if (sessionId) {
+      try {
+        execT3Cli(cli, ["auth", "session", "revoke", sessionId, "--base-dir", baseDir]);
+      } catch {
+        // Best-effort revocation; short 5m TTL still bounds lifetime.
+      }
+    }
+  }
 }

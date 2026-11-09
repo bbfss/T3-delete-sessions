@@ -30,8 +30,14 @@ request.json 为对应工具参数对象；inspect_target 使用 `{}`。其他�
 8. worker回传完整JSON回执；协调者在所属环境用官方读接口核验。只有deleted/already_deleted且环境、会话、node_id一致的回执才计为完成。保存实际回执，不能自己补写成功。远端全部成功之前禁止开始任何本地删除；failed/blocked/unverified/离线保留为pending，相关父入口保留。
 9. 原始plan与receipts保存在会话历史之外，便于重试。已删节点再次查询可返回already_deleted。清理worker保持可用并回报，不自删；需要清理worker时另一次显式调用处理。
 
-报告各设备成功/受阻数量。T3删除是会话记录状态变化，插件保留原生provider历史和外部项目/worktree文件；不得宣称物理清空。只核验配置不能算执行成功。
+报告各设备成功/受阻数量。在线删除同时核验三层（T3 会话记录、底层原生会话、独占 T3 scratch 目录），外部用户项目与 Git worktree 始终保留。只核验配置不能算执行成功。
 
-## 会话工作目录
+## 会话工作目录与原生会话物理清理（3 层全覆盖）
 
-使用 T3-delete-sessions 1.8.0+。所有在线删除入口在核实删除成功后，完整移除目标会话独占的 T3 scratch 一级目录（含隐藏文件及目录）。仍有未删除会话使用该目录或其子目录时保留并报告 retained_shared；外部项目、Git worktree、原生 provider 历史保留。归档、预览和离线快照不删除目录。跨设备在目录所属机器执行并在回执返回 scratchDirectories。
+使用 `T3-delete-sessions` 1.8.0+（纯 Node.js 零外部依赖，跨 macOS / Windows / Linux 通用）。每次在线删除在确认 T3 `deleted_at` 后自动清理并核验：
+- **Codex / ChatGPT（`codex`）**：官方 `codex app-server --stdio` `thread/delete`（含 `active writer` 归档释放与退避重试）+ `thread/read`、`state_*.sqlite` 及 `sessions/`、`archived_sessions/` rollout 文件双核验，确保 ChatGPT 客户端侧栏不再残留。
+- **Claude Code（`claude` / `claudeAgent`）**：零依赖精确清理 `<UUID>.jsonl`、`<UUID>/`（含子 Agent）、`session-env/<UUID>`、`file-history/<UUID>` 及空 scratch 项目目录，保留普通项目的 `memory/`。
+- **Antigravity（`antigravity`）**：清理 `<userdata>/providers/antigravity/*/antigravity-acp/` 下的 `conversations/<ID>.*`、`brain/<ID>/` 及递归 `INVOKE_SUBAGENT` 子会话。
+- **独占 `scratch/` 目录**：物理移除无存活会话共用的 `<t3-home>/scratch/<dir>`（含隐藏目录），共享目录报告 `retained_shared`，外部项目与 Git worktree 保留。
+
+原生端必须返回 `native.complete=true` 方计为 `completed`；`incomplete_native`、`failed`、`blocked`、`unsupported`、`unverified` 不计入远端成功门禁，且可用 `delete_native_sessions` 对同一精确 `thread_id` 补清。

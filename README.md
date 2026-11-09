@@ -24,11 +24,12 @@ inspection only. Reconnect the MCP after upgrading to load the new tools.
 
 ## Tools
 
-- `inspect_target`: returns hostname, resolved database path and write mode.
-- `delete_subsessions`: selects descendants of an explicit thread ID, preserving the parent.
-- `delete_family`: selects descendants; includes the parent only with `keep_parent: false`.
-- `schedule_delete_family`: spawns an OS-detached background worker (`Win32_Process.Create` on Windows, detached `setsid` + `SIGHUP` ignore on macOS/Linux) that waits `delay_ms` (default `1500ms`) and executes online `delete_family(..., keep_parent: false)`, writing a verified external JSON receipt so `/deletefamily` (`$deletefamily`) finishes in seconds without killing its own MCP call mid-flight.
-- `delete_orphans`: selects orphan roots and their descendants; `archive_only: true` archives them.
+- `inspect_target`: returns hostname, resolved database path, `environment_id`, and write mode.
+- `delete_subsessions` / `archive_subsessions`: selects descendants of an explicit thread ID, preserving the parent (`keep_parent: true`).
+- `delete_family` / `archive_family`: selects descendants and the parent itself by default (`keep_parent: false`; pass `keep_parent: true` to retain the parent).
+- `schedule_delete_family` / `schedule_archive_family`: spawns an OS-detached background worker (`Win32_Process.Create` on Windows, detached `setsid` + `SIGHUP` ignore on macOS/Linux) that waits `delay_ms` (default `1500ms`) and executes online `delete_family` / `archive_family` (`keep_parent: false`), writing a verified external JSON receipt so `/deletefamily` (`$deletefamily`) and `/archivefamily` (`$archivefamily`) finish in seconds without killing their own MCP call mid-flight.
+- `delete_orphans` / `archive_orphans`: selects local orphan roots and their descendants while automatically excluding cross-device delegated sessions whose parent lives on another T3 environment (`delegatedFrom.environmentId != localEnvironmentId`).
+- `delete_native_sessions`: deletes and verifies underlying native conversations (plus exclusive scratch directories if the T3 thread is already deleted) for an explicit T3 `thread_id`.
 
 All cleanup tools default to `dry_run: true`. Supply `target_host` and `db_path`
 exactly as returned by `inspect_target`, plus `thread_id` for family operations.
@@ -47,14 +48,14 @@ Example preview:
 
 ## Online cleanup (recommended)
 
-Use the database and URL of the **same running T3 environment**:
+Use `--auto-local` on the target host (resolves `T3CODE_HOME` or `~/.t3` automatically across macOS, Windows, and Linux), or pass explicit `--db`, `--t3-url`, and `--t3-cli`:
 
 ```json
 {
   "mcpServers": {
     "t3-delete-sessions": {
       "command": "npx",
-      "args": ["-y", "github:bbfss/T3-delete-sessions", "--db", "/absolute/t3-base/userdata/statev2.sqlite", "--t3-url", "http://127.0.0.1:3773", "--t3-cli", "/absolute/path/to/t3"]
+      "args": ["-y", "github:bbfss/T3-delete-sessions", "--auto-local"]
     }
   }
 }
@@ -62,20 +63,17 @@ Use the database and URL of the **same running T3 environment**:
 
 Call `inspect_target`, preview the requested family, then pass `dry_run: false`
 with the same explicit target. `delete_subsessions` preserves the parent;
-`delete_family` includes it only with `keep_parent: false`.
+`delete_family` deletes both descendants and parent by default (`keep_parent: false`).
 
-Online mode reads the family from the local database, obtains a five-minute
-bearer session through the local T3 CLI for that database's base directory,
-and sends official `thread.stop` and `thread.delete` (or `thread.archive`)
-commands over T3's WebSocket RPC. It checks each selected thread's resulting
-state. Tokens stay inside the command process. A failure may follow successful
-earlier commands; inspect the family before retrying. This mode does not require
-`offline_confirmed` or `--allow-offline-writes`.
+Online deletion performs verified **3-layer physical cleanup**:
+1. **T3 Layer**: Issues a short-lived bearer session via the local T3 CLI, dispatches official `thread.stop` + `thread.delete` (or `thread.archive`) commands over T3's WebSocket RPC, verifies `deleted_at` / `archived_at` in SQLite, and immediately revokes the temporary bearer session.
+2. **Native Harness Layer** (`action="delete"`): Maps each deleted T3 thread via `orchestration_v2_projection_provider_threads` (`nativeThreadRef`, protecting any conversation still shared with a live T3 thread):
+   - **Codex / ChatGPT (`codex`)**: Runs official `codex app-server --stdio` `thread/delete` (with `thread/archive` + retry backoff if T3 is still detaching its writer lock) and verifies absence in `thread/read`, `state_*.sqlite`, `sessions/`, and `archived_sessions/`.
+   - **Claude Code (`claude` / `claudeAgent`)**: Zero-dependency removal of `<UUID>.jsonl`, `<UUID>/` sidecars/subagents, `session-env/<UUID>`, `file-history/<UUID>`, and empty T3 scratch folders under `~/.claude/projects/`.
+   - **Antigravity (`antigravity`)**: Removes `conversations/<ID>.*` and `brain/<ID>/` (including recursively discovered `INVOKE_SUBAGENT` child conversations) across `<userdata>/providers/antigravity/*/antigravity-acp/`.
+3. **Scratch Workspace Layer** (`action="delete"`): Physically removes each deleted thread's exclusive `<t3-home>/scratch/<dir>` (including hidden files/directories), while preserving shared directories (`retained_shared`), `.git` repositories (`retained_git`), and external user projects / Git worktrees.
 
-Requires only Node.js (`>= 22.12`) and the official T3 CLI on the MCP host (`t3` or Windows `t3.cmd`) — no Python runtime or external npm packages are required. The database
-must be at `<base-dir>/userdata/statev2.sqlite`. The server URL must belong to
-that base directory; a different environment will reject its bearer token.
-The server remains running during cleanup. The UI delete button itself is not patched.
+Requires only Node.js (`>= 22.12`) and the official T3 CLI on the MCP host (`t3` or Windows `t3.cmd`) — no Python runtime or external npm packages are required.
 
 ## Offline writes
 
@@ -87,8 +85,8 @@ the flag does not detect or stop T3. Use T3's official interface for live sessio
 Updates mark the selected projection rows and append local database event records
 in one transaction. This is **not an official T3 API call**, does not broadcast to
 a live UI, does not stop agents and does not physically erase conversation data.
-Online deletion removes each deleted thread’s exclusive T3 scratch directory, including hidden files and the directory itself. Directories still used by undeleted threads, external projects, Git worktrees and provider-native history are preserved. Archive, preview and offline operations preserve files. This applies to family, descendants, orphans and cross-device ancestor pruning.
-A preview reports `parentDeleted: false`; successful writes report
+Archive, preview and offline operations preserve files.
+A preview reports `parentDeleted: false`; successful offline writes report
 `updated_offline_database`, not physical deletion.
 
 The SQL targets the schema exercised in `tests/test_cleaner.mjs`; compatibility
@@ -202,3 +200,7 @@ If you manage shared instructions, skills, and MCP servers with **Magpie** (whic
 3. **Ensure `$<skill-name>` is recognized alongside `/<skill-name>`**:
    Selecting a skill from T3 Code's `/` menu inserts `$<skill-name>` (Codex syntax). Codex auto-expands `$<skill-name>`, whereas Antigravity passes the literal text `$<skill-name>` to the model. Keep `$<skill-name>` in skill descriptions (included in `skills/*/SKILL.md` in `1.6.0+`) and in shared `GEMINI.md` instructions so Antigravity immediately loads the matching `SKILL.md`.
 
+
+## Native deletion (development)
+
+Online deletion now checks native conversation mappings and returns `incomplete_native` unless all native endpoints are verified deleted. Codex uses the official app-server deletion API; active writers remain a reported failure requiring release by the owning app. Claude uses the official Agent SDK to delete and verify local sessions. Antigravity per-conversation deletion is not implemented and returns `unsupported`. Provider cloud records are outside these local SDK guarantees. A T3 tombstone alone does not count as full deletion. `delete_native_sessions` retries native cleanup for an exact T3 thread, including one already deleted. Scratch cleanup waits for native verification. These changes are not yet released.

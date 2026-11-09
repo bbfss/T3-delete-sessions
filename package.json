@@ -18,7 +18,7 @@
   ],
   "scripts": {
     "start": "node ./bin/cli.js",
-    "test": "node --test tests/test_cleaner.mjs tests/test_family.mjs tests/test_platform.mjs tests/test_self_delete.mjs tests/test_scratch.mjs"
+    "test": "node --test tests/test_cleaner.mjs tests/test_family.mjs tests/test_platform.mjs tests/test_self_delete.mjs tests/test_scratch.mjs tests/test_native.mjs"
   },
   "repository": {
     "type": "git",

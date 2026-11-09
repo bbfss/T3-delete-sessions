@@ -1,3 +1,4 @@
+import { nativeEndpoints, deleteNativeEndpoints } from './native.js';
 import { existsSync, readFileSync } from "node:fs";
 import os from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
@@ -65,7 +66,7 @@ export function toolDefinitions() {
       required.push("thread_id");
     }
     if (isFamily) {
-      properties.keep_parent = { type: "boolean", default: true };
+      properties.keep_parent = { type: "boolean", default: false };
     }
     if (!isArchiveTool) {
       properties.archive_only = { type: "boolean", default: false };
@@ -74,7 +75,7 @@ export function toolDefinitions() {
       name,
       description: isArchiveTool
         ? "Preview by default. In online mode, stop and archive selected threads (recoverable) through T3 official commands. Offline mode requires explicit opt-in."
-        : "Preview by default. In online mode, stop and clean selected threads through T3 official commands. Offline mode requires explicit opt-in. Removes exclusive T3 scratch directories after online deletion; preserves provider files and external worktrees.",
+        : "Preview by default. In online mode, stop and delete selected threads through T3 official commands, delete and verify underlying native conversations (Codex/ChatGPT, Claude, Antigravity), and remove exclusive T3 scratch directories while preserving shared folders and external git worktrees.",
       inputSchema: {
         type: "object",
         properties,
@@ -160,6 +161,17 @@ export function toolDefinitions() {
     }
   );
 
+  result.push({
+    name: "delete_native_sessions",
+    description:
+      "Delete and verify native conversations (and exclusive scratch directories if the T3 thread is already deleted) mapped to one exact T3 thread. Preview by default.",
+    inputSchema: {
+      type: "object",
+      properties: { ...common, thread_id: { type: "string" } },
+      required: ["target_host", "db_path", "thread_id"],
+      additionalProperties: false,
+    },
+  });
   return result;
 }
 
@@ -211,7 +223,8 @@ export async function callTool(
     db_path: dbConfigPath,
     offline_writes_enabled: allowOfflineWrites,
     t3_url: t3Url,
-    native_files: "preserved",
+    native_files: "delete_and_verify_per_endpoint",
+    scratch_directories: "remove_exclusive_after_delete",
     worktrees: "preserved",
   };
 
@@ -274,6 +287,18 @@ export async function callTool(
   }
 
   const dryRun = args.dry_run === undefined ? true : args.dry_run;
+  if (name === "delete_native_sessions") {
+    const endpoints = nativeEndpoints(dbConfigPath, [args.thread_id]);
+    if (dryRun) return { target, status: "preview", endpoints };
+    const native = await deleteNativeEndpoints(endpoints, { dbPath: dbConfigPath });
+    const scratchDirectories = removeDeletedScratch(dbConfigPath, [args.thread_id]);
+    return {
+      target,
+      status: native.complete ? "completed" : "incomplete_native",
+      native,
+      scratchDirectories,
+    };
+  }
   if (name === "schedule_delete_family" || name === "schedule_archive_family") {
     const schedAction = name === "schedule_archive_family" ? "archive" : "delete";
     if (!t3Url) {
@@ -344,7 +369,7 @@ export async function callTool(
         keepParent: isSubsessions
           ? true
           : args.keep_parent === undefined
-            ? true
+            ? false
             : args.keep_parent,
         action,
       });
@@ -356,6 +381,7 @@ export async function callTool(
       ids.push(args.thread_id);
     }
 
+    const nativePlan = action === "delete" ? nativeEndpoints(dbConfigPath, ids) : [];
     const commands = [];
     for (const tid of ids) {
       commands.push(
@@ -394,8 +420,14 @@ export async function callTool(
       });
     }
 
-    if (action === "delete") result.scratchDirectories = removeDeletedScratch(dbConfigPath, ids);
     result.status = "completed_via_t3";
+    if (action === "delete") {
+      result.native = await deleteNativeEndpoints(nativePlan, {
+        dbPath: dbConfigPath,
+      });
+      result.scratchDirectories = removeDeletedScratch(dbConfigPath, ids);
+      result.status = result.native.complete ? "completed" : "incomplete_native";
+    }
     result.parentDeleted = Boolean(result.parentSelected) && action === "delete";
     result.parentArchived = Boolean(result.parentSelected) && action === "archive";
     for (const item of items) {

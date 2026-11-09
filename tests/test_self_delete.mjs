@@ -161,12 +161,12 @@ test("spawnDetachedSelfDelete supports win32 WMI launcher and runDetachedWorker 
     );
 
     assert.equal(sleptMs, 200);
-    assert.equal(finalReceipt.status, "completed_via_t3");
+    assert.equal(finalReceipt.status, "incomplete_native");
     assert.equal(finalReceipt.parentDeleted, true);
     assert.equal(finalReceipt.childrenDeleted, 1);
 
     const onDisk = JSON.parse(readFileSync(scheduled.receipt_path, "utf8"));
-    assert.equal(onDisk.status, "completed_via_t3");
+    assert.equal(onDisk.status, "incomplete_native");
     assert.equal(onDisk.parentDeleted, true);
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -305,27 +305,73 @@ test("symmetric archive tools (archive_subsessions, schedule_archive_family, and
 });
 
 for (const tool of ["delete_family", "delete_subsessions", "delete_orphans", "archive_family"]) {
-  test(`${tool} cleans only deleted scratch directories`, async () => {
+  test(`${tool} removes exclusive deleted scratch directories while archive and retained parents preserve theirs`, async () => {
     const { root, db } = createSelfDeleteFixture();
     try {
-      withDatabase(db, { readOnly: false }, conn => {
+      withDatabase(db, { readOnly: false }, (conn) => {
         for (const id of ["root-1", "child-1"]) {
           const dir = join(root, "scratch", id);
           mkdirSync(join(dir, ".agents", "skills"), { recursive: true });
-          conn.prepare("UPDATE orchestration_v2_projection_threads SET payload_json = json_set(payload_json, '$.worktreePath', ?) WHERE thread_id = ?").run(dir, id);
+          conn
+            .prepare(
+              "UPDATE orchestration_v2_projection_threads SET payload_json = json_set(payload_json, '$.worktreePath', ?) WHERE thread_id = ?"
+            )
+            .run(dir, id);
         }
-        if (tool === "delete_orphans") conn.exec("UPDATE orchestration_v2_projection_threads SET deleted_at='before' WHERE thread_id='root-1'");
+        if (tool === "delete_orphans") {
+          conn.exec(
+            "UPDATE orchestration_v2_projection_threads SET deleted_at='before' WHERE thread_id='root-1'"
+          );
+        }
       });
-      await callTool(tool, { target_host: os.hostname(), db_path: db, ...(tool.endsWith("family") ? { thread_id: "root-1", keep_parent: false } : tool.endsWith("subsessions") ? { thread_id: "root-1" } : {}), dry_run: false }, { db, t3Url: "http://localhost:3773" }, {
-        dispatchFn: async ({ commands }) => withDatabase(db, { readOnly: false }, conn => {
-          for (const cmd of commands) {
-            const col = cmd.type === "thread.delete" ? "deleted_at" : cmd.type === "thread.archive" ? "archived_at" : null;
-            if (col) conn.prepare(`UPDATE orchestration_v2_projection_threads SET ${col}='now' WHERE thread_id=?`).run(cmd.threadId);
-          }
-        })
-      });
-      assert.equal(existsSync(join(root, "scratch", "child-1")), tool === "archive_family");
-      assert.equal(existsSync(join(root, "scratch", "root-1")), tool !== "delete_family");
-    } finally { rmSync(root, { recursive: true, force: true }); }
+      await callTool(
+        tool,
+        {
+          target_host: os.hostname(),
+          db_path: db,
+          ...(tool.endsWith("family")
+            ? { thread_id: "root-1" }
+            : tool.endsWith("subsessions")
+              ? { thread_id: "root-1" }
+              : {}),
+          dry_run: false,
+        },
+        { db, t3Url: "http://localhost:3773" },
+        {
+          dispatchFn: async ({ commands }) =>
+            withDatabase(db, { readOnly: false }, (conn) => {
+              for (const cmd of commands) {
+                const col =
+                  cmd.type === "thread.delete"
+                    ? "deleted_at"
+                    : cmd.type === "thread.archive"
+                      ? "archived_at"
+                      : null;
+                if (col) {
+                  conn
+                    .prepare(
+                      `UPDATE orchestration_v2_projection_threads SET ${col}='now' WHERE thread_id=?`
+                    )
+                    .run(cmd.threadId);
+                }
+              }
+            }),
+        }
+      );
+      if (tool === "archive_family") {
+        assert.equal(existsSync(join(root, "scratch", "child-1")), true);
+        assert.equal(existsSync(join(root, "scratch", "root-1")), true);
+      } else if (tool === "delete_subsessions" || tool === "delete_orphans") {
+        assert.equal(existsSync(join(root, "scratch", "child-1")), false);
+        // In delete_subsessions root-1 is alive; in delete_orphans root-1 was not in ids
+        assert.equal(existsSync(join(root, "scratch", "root-1")), true);
+      } else {
+        // delete_family (default keep_parent=false) removes both!
+        assert.equal(existsSync(join(root, "scratch", "child-1")), false);
+        assert.equal(existsSync(join(root, "scratch", "root-1")), false);
+      }
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 }

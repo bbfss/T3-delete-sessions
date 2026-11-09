@@ -1,16 +1,37 @@
-import { existsSync, rmSync, lstatSync } from "node:fs";
+import { existsSync, rmSync, lstatSync, readFileSync } from "node:fs";
 import { dirname, resolve, sep, join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { withDatabase, withTransaction } from "./sqlite.js";
 
-export function findDescendantTree(db, rootThreadId) {
+export function readLocalEnvironmentId(dbPath) {
+  if (!dbPath) return null;
+  const identityFile = join(dirname(resolve(dbPath)), "environment-id");
+  if (!existsSync(identityFile)) return null;
+  try {
+    return readFileSync(identityFile, "utf8").trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+export function findDescendantTree(
+  db,
+  rootThreadId,
+  { localEnvironmentId = null } = {}
+) {
   const stmt = db.prepare(`
     SELECT thread_id, title, default_provider, created_at, archived_at, deleted_at, payload_json
     FROM orchestration_v2_projection_threads
     WHERE deleted_at IS NULL
       AND (
         json_extract(payload_json, '$.lineage.parentThreadId') = ?
-        OR json_extract(payload_json, '$.delegatedFrom.threadId') = ?
+        OR (
+          json_extract(payload_json, '$.delegatedFrom.threadId') = ?
+          AND (
+            json_extract(payload_json, '$.delegatedFrom.environmentId') IS NULL
+            OR (? IS NOT NULL AND json_extract(payload_json, '$.delegatedFrom.environmentId') = ?)
+          )
+        )
         OR thread_id IN (
             SELECT child_thread_id FROM orchestration_v2_projection_subagents
             WHERE thread_id = ? AND child_thread_id IS NOT NULL
@@ -22,7 +43,13 @@ export function findDescendantTree(db, rootThreadId) {
   const treeNodes = [];
 
   function traverse(parentId, depth) {
-    const children = stmt.all(parentId, parentId, parentId);
+    const children = stmt.all(
+      parentId,
+      parentId,
+      localEnvironmentId,
+      localEnvironmentId,
+      parentId
+    );
     for (const child of children) {
       const cid = child.thread_id;
       if (visited.has(cid) || cid === rootThreadId) {
@@ -39,31 +66,39 @@ export function findDescendantTree(db, rootThreadId) {
   return treeNodes.map((entry) => entry.node);
 }
 
-export function scanOrphanSessions(db) {
+export function scanOrphanSessions(db, { localEnvironmentId = null } = {}) {
   const rows = db
     .prepare(`
       WITH all_threads AS (
           SELECT
               thread_id, title, default_provider, deleted_at, archived_at, created_at,
               json_extract(payload_json, '$.lineage.parentThreadId') as parent_id,
-              json_extract(payload_json, '$.delegatedFrom.threadId') as delegated_parent_id,
+              CASE
+                WHEN json_extract(payload_json, '$.delegatedFrom.threadId') IS NOT NULL
+                 AND (
+                   json_extract(payload_json, '$.delegatedFrom.environmentId') IS NULL
+                   OR (? IS NOT NULL AND json_extract(payload_json, '$.delegatedFrom.environmentId') = ?)
+                 )
+                THEN json_extract(payload_json, '$.delegatedFrom.threadId')
+                ELSE NULL
+              END as local_delegated_parent_id,
               json_extract(payload_json, '$.worktreePath') as worktree_path,
               payload_json
           FROM orchestration_v2_projection_threads
       )
       SELECT
           t.thread_id, t.title, t.default_provider,
-          COALESCE(t.parent_id, t.delegated_parent_id) as parent_id,
+          COALESCE(t.parent_id, t.local_delegated_parent_id) as parent_id,
           p.title as parent_title, p.deleted_at as parent_deleted_at,
           t.worktree_path, t.payload_json
       FROM all_threads t
-      LEFT JOIN all_threads p ON p.thread_id = COALESCE(t.parent_id, t.delegated_parent_id)
-      WHERE (t.parent_id IS NOT NULL OR t.delegated_parent_id IS NOT NULL)
+      LEFT JOIN all_threads p ON p.thread_id = COALESCE(t.parent_id, t.local_delegated_parent_id)
+      WHERE (t.parent_id IS NOT NULL OR t.local_delegated_parent_id IS NOT NULL)
         AND t.deleted_at IS NULL
         AND (p.thread_id IS NULL OR p.deleted_at IS NOT NULL)
       ORDER BY t.created_at DESC
     `)
-    .all();
+    .all(localEnvironmentId, localEnvironmentId);
   return rows.map((row) => ({ ...row }));
 }
 
@@ -130,12 +165,16 @@ export function markThreadDeleted(
 }
 
 export function cleanOrphans(dbPath, { dryRun = true, action = "delete" } = {}) {
+  const localEnvironmentId = readLocalEnvironmentId(dbPath);
   return withDatabase(dbPath, { readOnly: dryRun }, (db) => {
-    const roots = scanOrphanSessions(db);
+    const roots = scanOrphanSessions(db, { localEnvironmentId });
     const orphans = [];
     const seen = new Set();
     for (const root of roots) {
-      for (const row of [...findDescendantTree(db, root.thread_id), root]) {
+      for (const row of [
+        ...findDescendantTree(db, root.thread_id, { localEnvironmentId }),
+        root,
+      ]) {
         if (!seen.has(row.thread_id)) {
           seen.add(row.thread_id);
           orphans.push(row);
@@ -171,8 +210,9 @@ export function cleanOrphans(dbPath, { dryRun = true, action = "delete" } = {}) 
 export function cleanFamily(
   threadId,
   dbPath,
-  { keepParent = true, dryRun = true, action = "delete" } = {}
+  { keepParent = false, dryRun = true, action = "delete" } = {}
 ) {
+  const localEnvironmentId = readLocalEnvironmentId(dbPath);
   return withDatabase(dbPath, { readOnly: dryRun }, (db) => {
     const targetRow = db
       .prepare(
@@ -183,8 +223,8 @@ export function cleanFamily(
       throw new Error(`Session ${threadId} not found in database.`);
     }
 
-    const descendants = findDescendantTree(db, threadId).filter((d) =>
-      action === "archive" ? d.archived_at == null : true
+    const descendants = findDescendantTree(db, threadId, { localEnvironmentId }).filter(
+      (d) => (action === "archive" ? d.archived_at == null : true)
     );
     let processedChildren = [];
     let parentProcessed = false;
@@ -221,18 +261,38 @@ export function cleanFamily(
   });
 }
 
-// Remove only T3-owned scratch directories after confirmed online deletion.
+// Remove only T3-owned exclusive scratch directories after confirmed online deletion.
 export function removeDeletedScratch(dbPath, ids) {
   const root = resolve(dirname(dirname(dbPath)), "scratch");
   return withDatabase(dbPath, { readOnly: true }, (db) => {
-    const rows = db.prepare("SELECT thread_id, deleted_at, payload_json FROM orchestration_v2_projection_threads").all();
-    const paths = rows.map(row => ({ ...row, path: JSON.parse(row.payload_json).worktreePath }));
+    const rows = db
+      .prepare(
+        "SELECT thread_id, deleted_at, payload_json FROM orchestration_v2_projection_threads"
+      )
+      .all();
+    const paths = rows.map((row) => ({
+      ...row,
+      path: JSON.parse(row.payload_json || "{}").worktreePath,
+    }));
+    const seenDirs = new Set();
     const results = [];
-    for (const row of paths.filter(row => ids.includes(row.thread_id) && row.deleted_at)) {
+    for (const row of paths.filter(
+      (row) => ids.includes(row.thread_id) && row.deleted_at
+    )) {
       if (!row.path || dirname(resolve(row.path)) !== root) continue;
       const directory = resolve(row.path);
-      if (paths.some(other => !other.deleted_at && other.path &&
-        (resolve(other.path) === directory || resolve(other.path).startsWith(directory + sep)))) {
+      if (seenDirs.has(directory)) continue;
+      seenDirs.add(directory);
+
+      if (
+        paths.some(
+          (other) =>
+            !other.deleted_at &&
+            other.path &&
+            (resolve(other.path) === directory ||
+              resolve(other.path).startsWith(directory + sep))
+        )
+      ) {
         results.push({ path: directory, status: "retained_shared" });
         continue;
       }
@@ -244,7 +304,10 @@ export function removeDeletedScratch(dbPath, ids) {
         if (lstatSync(directory).isSymbolicLink()) continue;
         rmSync(directory, { recursive: true, force: true });
       }
-      results.push({ path: directory, status: "removed" });
+      results.push({
+        path: directory,
+        status: existsSync(directory) ? "failed" : "removed",
+      });
     }
     return results;
   });

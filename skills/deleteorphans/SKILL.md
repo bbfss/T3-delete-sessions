@@ -3,8 +3,13 @@ name: deleteorphans
 description: 显式 /deleteorphans 或 $deleteorphans 预览并清理指定T3环境中已核实的孤儿会话；不把远端父节点当作本地缺失父节点。
 ---
 
-用户实际发送 `/deleteorphans` 或 `$deleteorphans` 时执行：先 `inspect_target` 确认环境，再预览 `delete_orphans`。核对每个候选的父节点环境：远端父会话、本轮协调者或执行worker、关系不明的候选必须排除。旧版扫描器只看本地父关系，不能对包含跨设备委派的环境直接全量执行。对可证明孤儿的目标，逐个核实本地家族及远端后代，按deletechilds的先远端成功再本地原则处理；有无法区分的候选时报告受阻。禁止调用旧t3-clean-sessions --orphans。
+用户实际发送 `/deleteorphans` 或 `$deleteorphans` 时执行：先 `inspect_target` 确认本机 `hostname`、`db_path` 与 `environment_id`，再调用 `delete_orphans(dry_run=true)` 预览。`T3-delete-sessions` 1.8.0+ 已在底层扫描器自动比对本机 `environment-id`，**自动排除 `delegatedFrom.environmentId` 属于远端设备的跨机委派会话**，不会把远端父节点当作本地缺失父节点；同时执行前仍须核实候选不含当前会话或活跃清理 worker。若某个本地孤儿自身曾向远端设备发起过跨设备委派，先按 [deletechilds](../deletechilds/SKILL.md) 先远端成功再本地的原则清理其远端后代，最后执行 `delete_orphans(dry_run=false)`。禁止调用旧 `t3-clean-sessions --orphans`。
 
-## 会话工作目录
+## 三层物理清理与完成条件
 
-使用 T3-delete-sessions 1.8.0+。所有在线删除入口在核实删除成功后，完整移除目标会话独占的 T3 scratch 一级目录（含隐藏文件及目录）。仍有未删除会话使用该目录或其子目录时保留并报告 retained_shared；外部项目、Git worktree、原生 provider 历史保留。归档、预览和离线快照不删除目录。跨设备在目录所属机器执行并在回执返回 scratchDirectories。
+`T3-delete-sessions` 1.8.0+ 在确认 T3 `deleted_at` 后自动清理并核验：
+1. **T3 会话记录**：官方 `thread.stop` + `thread.delete` 并核验 `deleted_at`。
+2. **原生客户端/本地会话文件**：自动清理并核验绑定的 Codex（ChatGPT 客户端不再残留）、Claude Code、Antigravity（含子会话）本地记录；其他存活会话共享的原生会话自动保护为 `blocked`。
+3. **独占 T3 `scratch/` 目录**：物理移除无存活会话共用的 `<t3-home>/scratch/<dir>`（含隐藏目录），共享目录与外部项目/Git worktree 保留。
+
+如实分别报告 T3、原生会话（`native.complete`）与 `scratchDirectories` 清理结果；若个别原生会话返回 `incomplete_native`，可用 `delete_native_sessions` 针对该 `thread_id` 重试补清。

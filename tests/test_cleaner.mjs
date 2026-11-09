@@ -308,3 +308,51 @@ test("CLI runs with empty PATH (zero Python dependency) and clean UTF-8 stdio", 
     ["grandchild", "中文子会话"]
   );
 });
+
+test("delete_family defaults to keep_parent=false while cross-device remote delegated threads are never misclassified as local orphans", async (t) => {
+  const f = createFixture();
+  t.after(f.cleanup);
+
+  writeFileSync(join(dirname(f.db), "environment-id"), "env-mac-local\n", "utf8");
+  withDatabase(f.db, { readOnly: false }, (conn) => {
+    const ins = conn.prepare(
+      "INSERT INTO orchestration_v2_projection_threads VALUES (?, ?, 'codex', 'now', 'now', NULL, NULL, ?)"
+    );
+    ins.run(
+      "remote-delegated-child",
+      "Remote Delegated Child",
+      JSON.stringify({
+        lineage: { parentThreadId: null },
+        delegatedFrom: {
+          environmentId: "env-vps-remote",
+          threadId: "remote-parent-id",
+        },
+      })
+    );
+    ins.run(
+      "local-delegated-orphan",
+      "Local Delegated Orphan",
+      JSON.stringify({
+        lineage: { parentThreadId: null },
+        delegatedFrom: {
+          environmentId: "env-mac-local",
+          threadId: "missing-local-parent",
+        },
+      })
+    );
+  });
+
+  const orphanPreview = await callTool("delete_orphans", f.args, f.config);
+  assert.deepEqual(
+    orphanPreview.orphans.map((o) => o.threadId),
+    ["local-delegated-orphan"]
+  );
+
+  const famRes = await callTool(
+    "delete_family",
+    { ...f.args, thread_id: "parent", dry_run: false, offline_confirmed: true },
+    f.config
+  );
+  assert.equal(famRes.parentDeleted, true);
+  assert.deepEqual(f.deleted(), ["child", "grandchild", "parent"]);
+});

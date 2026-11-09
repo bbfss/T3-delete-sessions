@@ -1,3 +1,4 @@
+import { nativeEndpoints, deleteNativeEndpoints } from './native.js';
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { findDescendantTree, removeDeletedScratch } from "./cleaner.js";
@@ -279,7 +280,7 @@ export async function executeStep(
     if (modeAction === "archive" && row.archived_at) {
       return { ...step, action: modeAction, status: "already_archived" };
     }
-    const descendants = findDescendantTree(db, tid);
+    const descendants = findDescendantTree(db, tid, { localEnvironmentId: env });
     if (modeAction === "delete") {
       for (const d of descendants) {
         const lineage = JSON.parse(d.payload_json).lineage || {};
@@ -316,8 +317,13 @@ export async function executeStep(
   });
 
   if (precheck) {
-    if (!dryRun && modeAction === "delete" && precheck.status === "already_deleted")
+    if (!dryRun && modeAction === "delete" && precheck.status === "already_deleted") {
+      precheck.native = await deleteNativeEndpoints(nativeEndpoints(dbPath, [tid]), {
+        dbPath,
+      });
       precheck.scratchDirectories = removeDeletedScratch(dbPath, [tid]);
+      if (!precheck.native.complete) precheck.status = "incomplete_native";
+    }
     return precheck;
   }
   if (dryRun) {
@@ -349,7 +355,7 @@ export async function executeStep(
     };
   }
 
-  return withDatabase(dbPath, { readOnly: true }, (db) => {
+  const verified = withDatabase(dbPath, { readOnly: true }, (db) => {
     const row = db
       .prepare(
         `SELECT ${selectCols} FROM orchestration_v2_projection_threads WHERE thread_id = ?`
@@ -382,8 +388,15 @@ export async function executeStep(
     return {
       ...step,
       action: modeAction,
-      ...(ok && modeAction === "delete" ? { scratchDirectories: removeDeletedScratch(dbPath, [tid]) } : {}),
       status: ok ? (modeAction === "archive" ? "archived" : "deleted") : "unverified",
     };
   });
+  if (verified.status === "deleted") {
+    verified.native = await deleteNativeEndpoints(nativeEndpoints(dbPath, [tid]), {
+      dbPath,
+    });
+    verified.scratchDirectories = removeDeletedScratch(dbPath, [tid]);
+    if (!verified.native.complete) verified.status = "incomplete_native";
+  }
+  return verified;
 }

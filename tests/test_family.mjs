@@ -136,7 +136,7 @@ test("protected alias rejected", () => {
   assert.throws(() => planCleanup(r, "root", "mac", "current"), /protected/);
 });
 
-test("deleted retry is verified without commands", async (t) => {
+test("deleted T3 retry still requires native verification", async (t) => {
   const env = makeTempEnv();
   t.after(env.cleanup);
   withDatabase(env.db, { readOnly: false }, (conn) => {
@@ -163,7 +163,7 @@ test("deleted retry is verified without commands", async (t) => {
       },
     }
   );
-  assert.equal(result.status, "already_deleted");
+  assert.equal(result.status, "incomplete_native");
   assert.equal(called, false);
 });
 

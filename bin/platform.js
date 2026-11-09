@@ -100,10 +100,48 @@ export function resolveT3Cli(
   );
 }
 
+export function resolveCodexCli(
+  cliArg = "codex",
+  {
+    env = process.env,
+    platform = process.platform,
+    homedir = os.homedir(),
+    fsOps = { existsSync, accessSync },
+  } = {}
+) {
+  if (cliArg !== "codex") {
+    return whichCommand(cliArg, { env, platform, fsOps }) || cliArg;
+  }
+  const extraDirs =
+    platform === "win32"
+      ? [
+          env.APPDATA ? win32.join(env.APPDATA, "npm") : (homedir ? win32.join(homedir, "AppData", "Roaming", "npm") : null),
+          homedir ? win32.join(homedir, ".local", "bin") : null,
+          homedir ? win32.join(homedir, ".cargo", "bin") : null,
+        ]
+      : [
+          homedir ? join(homedir, ".local", "bin") : null,
+          "/opt/homebrew/bin",
+          "/usr/local/bin",
+          homedir ? join(homedir, ".npm-global", "bin") : null,
+          homedir ? join(homedir, ".cargo", "bin") : null,
+          platform === "darwin"
+            ? "/Applications/ChatGPT.app/Contents/Resources/CodexCLI.app/Contents/MacOS"
+            : null,
+        ];
+  return (
+    whichCommand(cliArg, { env, platform, extraDirs, fsOps }) || cliArg
+  );
+}
+
 export function buildCliExecSpec(
   cli,
   args,
-  { platform = process.platform, env = process.env } = {}
+  {
+    platform = process.platform,
+    env = process.env,
+    stdio = ["ignore", "pipe", "pipe"],
+  } = {}
 ) {
   if (!cli || typeof cli !== "string") {
     throw new Error("T3 CLI path is required");
@@ -122,7 +160,7 @@ export function buildCliExecSpec(
       args: ["/d", "/v:off", "/s", "/c", `"${quoted.join(" ")}"`],
       options: {
         encoding: "utf8",
-        stdio: ["ignore", "pipe", "pipe"],
+        stdio,
         windowsVerbatimArguments: true,
         windowsHide: true,
       },
@@ -134,7 +172,7 @@ export function buildCliExecSpec(
     args,
     options: {
       encoding: "utf8",
-      stdio: ["ignore", "pipe", "pipe"],
+      stdio,
       windowsHide: true,
     },
   };
