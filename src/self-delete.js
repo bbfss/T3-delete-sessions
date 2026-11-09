@@ -182,17 +182,20 @@ export async function runDetachedWorker(
   }
 
   try {
-    const result = await executeFn(
-      {
-        target_host: job.target_host,
-        db_path: job.db_path,
-        thread_id: job.thread_id,
-        keep_parent: false,
-        dry_run: false,
-      },
-      job.config,
-      action
-    );
+    const execArgs = {
+      target_host: job.target_host,
+      db_path: job.db_path,
+      thread_id: job.thread_id,
+      keep_parent: false,
+      dry_run: false,
+    };
+    if (typeof job.confirm_remove_git_worktrees === "boolean") {
+      execArgs.confirm_remove_git_worktrees = job.confirm_remove_git_worktrees;
+    }
+    if (Array.isArray(job.remote_receipts)) {
+      execArgs.remote_receipts = job.remote_receipts;
+    }
+    const result = await executeFn(execArgs, job.config, action);
     const receipt = {
       status: result.status ?? "completed_via_t3",
       action,

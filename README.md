@@ -48,14 +48,19 @@ Example preview:
 
 ## Online cleanup (recommended)
 
-Use `--auto-local` on the target host (resolves `T3CODE_HOME` or `~/.t3` automatically across macOS, Windows, and Linux), or pass explicit `--db`, `--t3-url`, and `--t3-cli`:
+Use `--auto-local` on the target host (resolves `T3CODE_HOME` or `~/.t3` automatically across macOS, Windows, and Linux), or pass explicit `--db`, `--t3-url`, and `--t3-cli`.
+
+To avoid older/buggy `npm` `GitFetcher requires an Arborist constructor to pack a tarball` errors on Linux VPS / Windows when `npx github:...` runs, you can use a zero-`npx` `node -e` git-cache launcher:
 
 ```json
 {
   "mcpServers": {
     "t3-delete-sessions": {
-      "command": "npx",
-      "args": ["-y", "github:bbfss/T3-delete-sessions", "--auto-local"]
+      "command": "node",
+      "args": [
+        "-e",
+        "const{spawn,execFileSync}=require('child_process'),fs=require('fs'),os=require('os'),p=require('path');const d=p.join(os.homedir(),'.cache','t3-delete-sessions'),c=p.join(d,'bin','cli.js'),u='https://github.com/bbfss/T3-delete-sessions.git';try{if(!fs.existsSync(c)){fs.mkdirSync(p.dirname(d),{recursive:true});execFileSync('git',['clone','--depth','1',u,d],{stdio:'ignore',timeout:20000});}else{execFileSync('git',['-C',d,'pull','--ff-only','--quiet'],{stdio:'ignore',timeout:8000});}}catch{}const k=spawn(process.execPath,[c,'--auto-local'],{stdio:'inherit',windowsHide:true});k.on('exit',e=>process.exit(e??1));"
+      ]
     }
   }
 }
@@ -66,12 +71,12 @@ with the same explicit target. `delete_subsessions` preserves the parent;
 `delete_family` deletes both descendants and parent by default (`keep_parent: false`).
 
 Online deletion performs verified **3-layer physical cleanup**:
-1. **T3 Layer**: Issues a short-lived bearer session via the local T3 CLI, dispatches official `thread.stop` + `thread.delete` (or `thread.archive`) commands over T3's WebSocket RPC, verifies `deleted_at` / `archived_at` in SQLite, and immediately revokes the temporary bearer session.
+1. **T3 Layer**: Issues a short-lived bearer session via the local T3 CLI, dispatches official `thread.stop` + `thread.delete` (or `thread.archive`) commands over T3's WebSocket RPC, verifies `deleted_at` / `archived_at` in SQLite, and immediately revokes the temporary bearer session. Also sweeps previously soft-deleted (`deleted_at IS NOT NULL`) descendants whose native/scratch files were left behind.
 2. **Native Harness Layer** (`action="delete"`): Maps each deleted T3 thread via `orchestration_v2_projection_provider_threads` (`nativeThreadRef`, protecting any conversation still shared with a live T3 thread):
-   - **Codex / ChatGPT (`codex`)**: Runs official `codex app-server --stdio` `thread/delete` (with `thread/archive` + retry backoff if T3 is still detaching its writer lock) and verifies absence in `thread/read`, `state_*.sqlite`, `sessions/`, and `archived_sessions/`.
-   - **Claude Code (`claude` / `claudeAgent`)**: Zero-dependency removal of `<UUID>.jsonl`, `<UUID>/` sidecars/subagents, `session-env/<UUID>`, `file-history/<UUID>`, and empty T3 scratch folders under `~/.claude/projects/`.
-   - **Antigravity (`antigravity`)**: Removes `conversations/<ID>.*` and `brain/<ID>/` (including recursively discovered `INVOKE_SUBAGENT` child conversations) across `<userdata>/providers/antigravity/*/antigravity-acp/`.
-3. **Scratch Workspace Layer** (`action="delete"`): Physically removes each deleted thread's exclusive `<t3-home>/scratch/<dir>` (including hidden files/directories), while preserving shared directories (`retained_shared`), `.git` repositories (`retained_git`), and external user projects / Git worktrees.
+   - **Codex / ChatGPT (`codex`)**: Collects recursive native subagent trees from `thread_spawn_edges` (`parent_thread_id -> child_thread_id`) before deleting edges, runs official `codex app-server --stdio` `thread/delete` (with `thread/archive` + retry backoff if T3 is still detaching its writer lock), and purges + verifies absence across `state_*.sqlite`, `sqlite/codex.db` (`local_thread_catalog`, `thread_timeline_ledger`, etc.), `session_index.jsonl`, `sessions/`, and `archived_sessions/`.
+   - **Claude Code (`claude` / `claudeAgent`)**: Zero-dependency removal of `<UUID>.jsonl`, `<UUID>/` sidecars/subagents, `session-env/<UUID>`, `file-history/<UUID>`, and empty T3 scratch/worktree folders under `~/.claude/projects/`.
+   - **Antigravity (`antigravity`)**: Removes `conversations/<ID>.*` and `brain/<ID>/` (including recursively discovered `INVOKE_SUBAGENT` child conversations while protecting retained IDs) across `<userdata>/providers/antigravity/*/antigravity-acp/`.
+3. **Scratch & Isolated Worktree Layer** (`action="delete"`): Physically removes each deleted thread's exclusive `<t3-home>/scratch/<dir>` (including hidden files/directories). When a deleted session's exclusive directory contains `.git` or is an isolated Git worktree (`<t3-home>/worktrees/...` or linked worktree), `dry_run: true` surfaces `worktreeConfirmationsRequired` so the agent can ask the user for confirmation first, and removes it when `confirm_remove_git_worktrees: true` is passed (while strictly protecting main user project roots in `projection_projects` and shared directories).
 
 Requires only Node.js (`>= 22.12`) and the official T3 CLI on the MCP host (`t3` or Windows `t3.cmd`) — no Python runtime or external npm packages are required.
 
@@ -109,15 +114,10 @@ MIT
 
 ## Cross-device cleanup
 
-Version 1.3 adds `plan_cross_device_cleanup` and `execute_cleanup_step`.
-The slash skills in `skills/` coordinate T3 delegates on the owning machines;
-the MCP does not silently forward local calls to another host.
-
-`plan_cross_device_cleanup` takes the verified session registry (`nodes`, each
-with `nodeId`, `parentNodeId` and `t3.environmentId/threadId`), the current
-`anchor_node_id`, `current_environment_id` and `current_thread_id`. It excludes
-the current thread and orders every remote endpoint before local endpoints.
-A remote-to-local nesting that conflicts with this order is rejected.
+Version 1.9 automatically discovers remote delegated descendants (`remoteChild: { environmentId, threadId, label }`) directly from T3's `orchestration_v2_projection_subagents` table without requiring manual JSON registration files.
+- `plan_cross_device_cleanup` can be called with `db_path` (omitting `registry`) to auto-build the `remote_then_local` plan directly from SQLite.
+- `delete_subsessions`, `delete_family`, and `schedule_delete_family` automatically block local deletion (`status: "blocked_by_remote_descendants"`) if unconfirmed remote children exist, unless verified `remote_receipts` are supplied.
+- On the remote target host, `execute_cleanup_step` autonomously expands and cleans any local subagents/descendants spawned under that remote session (`autoExpandedDescendants`) in post-order before deleting the remote session itself.
 
 Each owning environment executes one step with `execute_cleanup_step`, passing
 the plan, `node_id`, actual success `receipts`, its `worker_thread_id`, and

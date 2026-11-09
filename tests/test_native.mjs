@@ -5,9 +5,11 @@ import {
   deleteClaude,
   deleteNativeEndpoints,
   nativeEndpoints,
+  purgeCodexLocalStorage,
+  verifyCodexLocalStorageGone,
 } from "../src/native.js";
 import { withDatabase } from "../src/sqlite.js";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -197,3 +199,97 @@ test("Antigravity deletion removes conversation db/wal/meta, brain dir, and recu
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("Codex storage purge covers state_*.sqlite, sqlite/codex.db catalog, session_index.jsonl, and recursive thread_spawn_edges while protecting retained IDs", () => {
+  const codexHome = mkdtempSync(join(tmpdir(), "codex-full-purge-"));
+  try {
+    mkdirSync(join(codexHome, "sqlite"), { recursive: true });
+    mkdirSync(join(codexHome, "sessions", "2026", "11", "09"), { recursive: true });
+
+    const parentId = "01a1be4b-ac2c-79c1-b7d9-558f2a47f9ca";
+    const childId = "01a1be4d-22b5-7981-b613-b4435b18179b";
+    const keptId = "01a1be4d-9999-7bb1-b059-131aa25413a1";
+
+    const parentRollout = join(
+      codexHome,
+      "sessions",
+      "2026",
+      "11",
+      "09",
+      `rollout-${parentId}.jsonl`
+    );
+    const childRollout = join(
+      codexHome,
+      "sessions",
+      "2026",
+      "11",
+      "09",
+      `rollout-${childId}.jsonl`
+    );
+    writeFileSync(parentRollout, "{}\n");
+    writeFileSync(childRollout, "{}\n");
+
+    const stateDb = join(codexHome, "state_5.sqlite");
+    writeFileSync(stateDb, "");
+    withDatabase(stateDb, { readOnly: false }, (db) => {
+      db.exec(`
+        CREATE TABLE threads(id TEXT PRIMARY KEY, rollout_path TEXT);
+        CREATE TABLE thread_spawn_edges(parent_thread_id TEXT, child_thread_id TEXT, status TEXT);
+        CREATE TABLE thread_turns(thread_id TEXT);
+      `);
+      db.prepare("INSERT INTO threads VALUES (?, ?)").run(parentId, parentRollout);
+      db.prepare("INSERT INTO threads VALUES (?, ?)").run(childId, childRollout);
+      db.prepare("INSERT INTO threads VALUES (?, NULL)").run(keptId);
+      db.prepare("INSERT INTO thread_spawn_edges VALUES (?, ?, 'open')").run(
+        parentId,
+        childId
+      );
+      db.prepare("INSERT INTO thread_turns VALUES (?)").run(parentId);
+      db.prepare("INSERT INTO thread_turns VALUES (?)").run(childId);
+    });
+
+    const codexDb = join(codexHome, "sqlite", "codex.db");
+    writeFileSync(codexDb, "");
+    withDatabase(codexDb, { readOnly: false }, (db) => {
+      db.exec(`
+        CREATE TABLE local_thread_catalog(host_id TEXT, thread_id TEXT, display_title TEXT);
+        CREATE TABLE thread_timeline_ledger(host_id TEXT, thread_id TEXT, sequence INTEGER);
+      `);
+      for (const id of [parentId, childId, keptId]) {
+        db.prepare("INSERT INTO local_thread_catalog VALUES ('local', ?, 'Title')").run(
+          id
+        );
+        db.prepare("INSERT INTO thread_timeline_ledger VALUES ('local', ?, 1)").run(id);
+      }
+    });
+
+    const sessionIndex = join(codexHome, "session_index.jsonl");
+    writeFileSync(
+      sessionIndex,
+      [
+        JSON.stringify({ id: parentId, thread_name: "Parent" }),
+        JSON.stringify({ id: childId, thread_name: "Child" }),
+        JSON.stringify({ id: keptId, thread_name: "Kept" }),
+      ].join("\n") + "\n"
+    );
+
+    // Before purge: verification detects presence in state_5.sqlite / codex.db / session_index.jsonl
+    assert.equal(verifyCodexLocalStorageGone([parentId], codexHome).gone, false);
+
+    // Purge parentId -> automatically discovers childId via thread_spawn_edges and purges both
+    const purgedIds = purgeCodexLocalStorage([parentId], codexHome);
+    assert.deepEqual(new Set(purgedIds), new Set([parentId, childId]));
+
+    const afterVerify = verifyCodexLocalStorageGone([parentId, childId], codexHome);
+    assert.deepEqual(afterVerify, { gone: true });
+
+    // Kept session remains intact in codex.db and session_index.jsonl
+    assert.equal(verifyCodexLocalStorageGone([keptId], codexHome).gone, false);
+    const remainingIndex = readFileSync(sessionIndex, "utf8").trim().split("\n");
+    assert.equal(remainingIndex.length, 1);
+    assert.equal(JSON.parse(remainingIndex[0]).id, keptId);
+  } finally {
+    rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+

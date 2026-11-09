@@ -9,13 +9,13 @@ description: 显式 /deletefathers 或 $deletefathers 在整棵family中只保�
 
 1. 复用 [deletechilds](../deletechilds/SKILL.md) 的身份核实、跨设备执行及回执机制，但本命令必须使用下面的范围。不得执行deletechilds的默认后代删除计划。
 2. 从当前节点向上核实直到最高祖先，并核实该family的所有分支；任何祖先缺失或跨设备归属未明时停止补查，不把缺失节点当作根。全部关系用真实environmentId/threadId和parentNodeId登记。
-3. 调用plan_cross_device_cleanup，传完整registry、当前anchor_node_id、current_environment_id、current_thread_id，**scope="preserve_current_subtree"**。核对protected包含当前节点及其全部后代；steps只含其补集。不得用delete_family对祖先整树删除。
-4. 先远端后本地，各阶段按后序执行execute_cleanup_step并保存实际回执。当前子树的任何任务、provider会话与执行worker都不能停止、取消或删除。尤其不得对祖先调用递归task_cancel或普通thread.stop；祖先删除由新版执行器的精确thread.delete处理。
-5. 删除祖先前，执行器检查仍存活的本地后代只包含protected。若保留分支是T3会级联删除的side chat，则父删除blocked：报告需要受支持的分离能力，保留相关祖先。不能修改SQLite伪造分离，不能绕过保护。新增后代或登记不全同样补查后再继续。
-6. 每步核验被删目标和保留节点。全部结束后，核实当前节点与所有保留后代仍可由官方接口读取，并将独立会话族登记中的当前节点作为保留树根维护，保留原谱系的历史记录。插件不改写T3历史lineage字段；当前节点展示为根与其历史来源是两回事。
+3. 调用 `plan_cross_device_cleanup`，传入 `db_path`、`current_environment_id`、`current_thread_id`（可省略或附带手动 `registry`），**`scope="preserve_current_subtree"`**。核对 `protected` 包含当前节点及其全部后代；`steps` 只含其补集。不得用 `delete_family` 对祖先整树删除。
+4. 先远端后本地，各阶段按后序执行 `execute_cleanup_step` 并保存实际回执（若 `dry_run=true` 返回 `worktreeConfirmationsRequired` 非空，先询问用户是否确认删除含 `.git`/worktree 目录，按用户意愿传入 `confirm_remove_git_worktrees`）。当前子树的任何任务、provider 会话与执行 worker 都不能停止、取消或删除。尤其不得对祖先调用递归 `task_cancel` 或普通 `thread.stop`；祖先删除由新版执行器的精确 `thread.delete` 处理。
+5. 删除祖先前，执行器检查仍存活的本地后代只包含 `protected`。若保留分支是 T3 会级联删除的 side chat，则父删除 `blocked`：报告需要受支持的分离能力，保留相关祖先。不能修改 SQLite 伪造分离，不能绕过保护。新增后代或登记不全同样补查后再继续。
+6. 每步核验被删目标和保留节点。全部结束后，核实当前节点与所有保留后代仍可由官方接口读取，并将独立会话族登记中的当前节点作为保留树根维护，保留原谱系的历史记录。插件不改写 T3 历史 lineage 字段；当前节点展示为根与其历史来源是两回事。
 
-远端失败/离线/未确认时，不开始本地删除，在当前聊天返回原因。报告删除与保留数量及任何受阻祖先，不把部分完成说成family已裁剪完成。保留外部项目/worktree；原生聊天必须删除并核验。
+远端失败/离线/未确认时，不开始本地删除，在当前聊天返回原因。报告删除与保留数量及任何受阻祖先，不把部分完成说成 family 已裁剪完成。保留外部用户主工程目录；原生聊天必须删除并核验。
 
 ## 会话工作目录与原生会话物理清理
 
-使用 `T3-delete-sessions` 1.8.0+。每个祖先或旁支节点经 `execute_cleanup_step` 在线删除后，自动清理并核验该节点绑定的 Codex / Claude / Antigravity 原生会话与独占 T3 `scratch/` 目录（若祖先与当前保留子树共享同一个 `scratch/` 目录或共享同一原生会话且存在存活保留后代，则自动保护为 `retained_shared` / `blocked`，绝不破坏当前保留子树的工作目录与上下文）。
+使用 `T3-delete-sessions` 1.9.0+。每个祖先或旁支节点经 `execute_cleanup_step` 在线删除后，自动清理并核验该节点绑定的 Codex（含 `sqlite/codex.db`、`session_index.jsonl` 与 `thread_spawn_edges` 子会话） / Claude / Antigravity 原生会话与独占 T3 `scratch/` 目录（若祖先与当前保留子树共享同一个 `scratch/` 目录或共享同一原生会话且存在存活保留后代，则自动保护为 `retained_shared` / `blocked`，绝不破坏当前保留子树的工作目录与上下文）。

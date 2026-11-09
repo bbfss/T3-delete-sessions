@@ -1,7 +1,11 @@
-import { nativeEndpoints, deleteNativeEndpoints } from './native.js';
+import { nativeEndpoints, deleteNativeEndpoints } from "./native.js";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { findDescendantTree, removeDeletedScratch } from "./cleaner.js";
+import {
+  findDescendantTree,
+  inspectWorktreesForThreads,
+  removeDeletedScratch,
+} from "./cleaner.js";
 import { withDatabase } from "./sqlite.js";
 import { dispatchT3Commands } from "./ws-rpc.js";
 
@@ -179,7 +183,7 @@ export async function executeStep(
   config,
   workerThreadId,
   dryRun = true,
-  { dispatchFn = dispatchT3Commands } = {}
+  { dispatchFn = dispatchT3Commands, confirmRemoveGitWorktrees = false } = {}
 ) {
   const modeAction = plan?.action ?? "delete";
   if (
@@ -249,6 +253,10 @@ export async function executeStep(
   const tid = step.thread_id;
   const preProtectedArchived = new Map();
   const selectCols = modeAction === "archive" ? "deleted_at, archived_at" : "deleted_at";
+
+  let autoExpandedChildIds = [];
+  let previouslyDeletedChildIds = [];
+
   const precheck = withDatabase(dbPath, { readOnly: true }, (db) => {
     if (modeAction === "archive") {
       for (const item of plan.protected) {
@@ -274,14 +282,19 @@ export async function executeStep(
         reason: "Thread not found in this environment",
       };
     }
-    if (row.deleted_at) {
-      return { ...step, action: modeAction, status: "already_deleted" };
-    }
-    if (modeAction === "archive" && row.archived_at) {
-      return { ...step, action: modeAction, status: "already_archived" };
-    }
+
     const descendants = findDescendantTree(db, tid, { localEnvironmentId: env });
     if (modeAction === "delete") {
+      const allDesc = findDescendantTree(db, tid, {
+        localEnvironmentId: env,
+        includeDeleted: true,
+      });
+      previouslyDeletedChildIds = allDesc
+        .filter(
+          (d) => d.deleted_at != null && !protectedPairs.has(`${env}\0${d.thread_id}`)
+        )
+        .map((d) => d.thread_id);
+
       for (const d of descendants) {
         const lineage = JSON.parse(d.payload_json).lineage || {};
         if (
@@ -299,45 +312,93 @@ export async function executeStep(
         }
       }
     }
+
     const remaining = descendants.filter(
       (d) =>
         !protectedPairs.has(`${env}\0${d.thread_id}`) &&
         (modeAction === "archive" ? d.archived_at == null : true)
     );
+
     if (remaining.length > 0) {
-      return {
-        ...step,
-        action: modeAction,
-        status: "blocked",
-        reason: "Live local descendants remain; refresh the plan",
-        remaining: remaining.map((d) => d.thread_id),
-      };
+      if (step.phase === "remote" && !step.ancestor) {
+        // Autonomous remote subtree expansion: when a remote endpoint has spawned
+        // local subagents on the remote machine that the coordinator's DB could not
+        // see, clean them postorder together with the remote target.
+        autoExpandedChildIds = remaining.map((d) => d.thread_id);
+      } else {
+        return {
+          ...step,
+          action: modeAction,
+          status: "blocked",
+          reason: "Live local descendants remain; refresh the plan",
+          remaining: remaining.map((d) => d.thread_id),
+        };
+      }
+    }
+
+    if (row.deleted_at && autoExpandedChildIds.length === 0) {
+      return { ...step, action: modeAction, status: "already_deleted" };
+    }
+    if (modeAction === "archive" && row.archived_at && autoExpandedChildIds.length === 0) {
+      return { ...step, action: modeAction, status: "already_archived" };
     }
     return null;
   });
 
+  const allStepThreadIds = [
+    ...new Set([...autoExpandedChildIds, ...previouslyDeletedChildIds, tid]),
+  ];
+
   if (precheck) {
     if (!dryRun && modeAction === "delete" && precheck.status === "already_deleted") {
-      precheck.native = await deleteNativeEndpoints(nativeEndpoints(dbPath, [tid]), {
-        dbPath,
+      precheck.native = await deleteNativeEndpoints(
+        nativeEndpoints(dbPath, allStepThreadIds),
+        { dbPath }
+      );
+      precheck.scratchDirectories = removeDeletedScratch(dbPath, allStepThreadIds, {
+        confirmRemoveGitWorktrees,
       });
-      precheck.scratchDirectories = removeDeletedScratch(dbPath, [tid]);
-      if (!precheck.native.complete) precheck.status = "incomplete_native";
+      const scratchFailed = precheck.scratchDirectories.some(
+        (s) => s.status === "failed"
+      );
+      if (!precheck.native.complete || scratchFailed) {
+        precheck.status = "incomplete_native";
+      }
     }
     return precheck;
   }
+
   if (dryRun) {
-    return { ...step, action: modeAction, status: "ready" };
+    const dryRes = { ...step, action: modeAction, status: "ready" };
+    if (autoExpandedChildIds.length > 0) {
+      dryRes.autoExpandedDescendants = autoExpandedChildIds;
+    }
+    if (modeAction === "delete") {
+      const wtReq = inspectWorktreesForThreads(dbPath, allStepThreadIds).filter(
+        (w) => w.requiresConfirmation
+      );
+      if (wtReq.length > 0) {
+        dryRes.worktreeConfirmationsRequired = wtReq;
+      }
+    }
+    return dryRes;
   }
 
-  const commands = [{ type: `thread.${modeAction}`, threadId: tid }];
+  const commands = [];
+  for (const childId of autoExpandedChildIds) {
+    commands.push(
+      { type: "thread.stop", threadId: childId, stopDelegatedTasks: false },
+      { type: `thread.${modeAction}`, threadId: childId }
+    );
+  }
   if (!step.ancestor) {
-    commands.unshift({
+    commands.push({
       type: "thread.stop",
       threadId: tid,
       stopDelegatedTasks: false,
     });
   }
+  commands.push({ type: `thread.${modeAction}`, threadId: tid });
 
   try {
     await dispatchFn({
@@ -384,19 +445,33 @@ export async function executeStep(
         };
       }
     }
-    const ok = modeAction === "archive" ? Boolean(row?.archived_at) : Boolean(row?.deleted_at);
+    const ok =
+      modeAction === "archive" ? Boolean(row?.archived_at) : Boolean(row?.deleted_at);
     return {
       ...step,
       action: modeAction,
       status: ok ? (modeAction === "archive" ? "archived" : "deleted") : "unverified",
     };
   });
+
+  if (autoExpandedChildIds.length > 0) {
+    verified.autoExpandedDescendants = autoExpandedChildIds;
+  }
+
   if (verified.status === "deleted") {
-    verified.native = await deleteNativeEndpoints(nativeEndpoints(dbPath, [tid]), {
-      dbPath,
+    verified.native = await deleteNativeEndpoints(
+      nativeEndpoints(dbPath, allStepThreadIds),
+      { dbPath }
+    );
+    verified.scratchDirectories = removeDeletedScratch(dbPath, allStepThreadIds, {
+      confirmRemoveGitWorktrees,
     });
-    verified.scratchDirectories = removeDeletedScratch(dbPath, [tid]);
-    if (!verified.native.complete) verified.status = "incomplete_native";
+    const scratchFailed = verified.scratchDirectories.some(
+      (s) => s.status === "failed"
+    );
+    if (!verified.native.complete || scratchFailed) {
+      verified.status = "incomplete_native";
+    }
   }
   return verified;
 }

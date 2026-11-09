@@ -32,9 +32,9 @@ T3 斜杠菜单可列出 Skill，选择后可能转换为 `$archivesessions` 或
 
 登记清单中的既有 `mode=archive` 只是历史偏好，不覆盖本次明确的 `/deletechilds`，也不因自动登记而授权删除。归档命令不得升级为删除；删除接口缺失或失败不得降级成归档后声称删除成功。项目文件、Git仓库、worktree和共享服务均不在会话清理范围内。
 
-## 启动时谱系登记（按需轻量化：单机免登记，跨设备补边）
+## 启动时谱系登记（全自动 SQLite 发现为主，脱离 T3 的外部持久 CLI 按需补边）
 
-> **重要优化（T3 1.8.0+）**：在同一台 T3 设备内的普通会话、原生 Subagent 与单机 `delegate_task`，T3 官方数据库（`lineage.parentThreadId`、`delegatedFrom`、`subagents`、`provider_threads`）已完整自动记录父子谱系与全套原生会话映射（Codex / Claude / Antigravity），**无需在启动时手写 `sessions.json` 或 `nodes/*.json`**。只有发生**跨设备委派**（`target.environmentId` 与本机不同）或**脱离 T3 直接在外部终端启动持久 CLI 子会话**时，才按下方规范写入跨设备登记回执。
+> **重要优化（T3 1.9.0+）**：在同一台 T3 设备内的普通会话、原生 Subagent、单机 `delegate_task` **以及跨设备远端 `delegate_task`（`driver='remote'` 的 `remoteChild`）**，T3 官方数据库（`lineage.parentThreadId`、`delegatedFrom`、`orchestration_v2_projection_subagents`、`provider_threads`）已完整自动记录父子谱系、远端目标 `(environmentId, threadId)` 与全套原生会话映射（Codex / Claude / Antigravity），**无需在启动时手写 `sessions.json` 或 `nodes/*.json`**。只有**脱离 T3 直接在外部终端启动持久 CLI 子会话**或存在**多跳跨设备孙代需要跨机汇总**时，才按下方规范写入跨设备登记回执。
 
 适用 Claude、Codex、Antigravity 及其他宿主，不要求父子使用相同提供方。跨设备或外部持久化派发时先完成登记再开始工作；恢复已有跨设备会话时复用原节点并补齐当前提供方会话 ID，不另建一棵树。清理器收到明确 `role=cleanup_worker` 的交接时跳过普通启动登记，不加入待归档树，也不继续创建清理器。
 

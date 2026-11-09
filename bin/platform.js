@@ -94,7 +94,30 @@ export function resolveT3Cli(
 ) {
   const pathMod = platform === "win32" ? win32 : { join };
   const extraDirs =
-    cliArg === "t3" && homedir ? [pathMod.join(homedir, ".local", "bin")] : [];
+    cliArg === "t3" && homedir
+      ? platform === "win32"
+        ? [
+            pathMod.join(homedir, ".local", "bin"),
+            env.APPDATA
+              ? win32.join(env.APPDATA, "npm")
+              : win32.join(homedir, "AppData", "Roaming", "npm"),
+            env.LOCALAPPDATA
+              ? win32.join(env.LOCALAPPDATA, "Programs", "t3-code")
+              : win32.join(homedir, "AppData", "Local", "Programs", "t3-code"),
+            env.LOCALAPPDATA
+              ? win32.join(env.LOCALAPPDATA, "pnpm")
+              : null,
+            env.LOCALAPPDATA
+              ? win32.join(env.LOCALAPPDATA, "Volta", "bin")
+              : null,
+            win32.join(homedir, "scoop", "shims"),
+          ]
+        : [
+            pathMod.join(homedir, ".local", "bin"),
+            "/opt/homebrew/bin",
+            "/usr/local/bin",
+          ]
+      : [];
   return (
     whichCommand(cliArg, { env, platform, extraDirs, fsOps }) || cliArg
   );
@@ -118,6 +141,9 @@ export function resolveCodexCli(
           env.APPDATA ? win32.join(env.APPDATA, "npm") : (homedir ? win32.join(homedir, "AppData", "Roaming", "npm") : null),
           homedir ? win32.join(homedir, ".local", "bin") : null,
           homedir ? win32.join(homedir, ".cargo", "bin") : null,
+          env.LOCALAPPDATA ? win32.join(env.LOCALAPPDATA, "pnpm") : null,
+          env.LOCALAPPDATA ? win32.join(env.LOCALAPPDATA, "Volta", "bin") : null,
+          homedir ? win32.join(homedir, "scoop", "shims") : null,
         ]
       : [
           homedir ? join(homedir, ".local", "bin") : null,

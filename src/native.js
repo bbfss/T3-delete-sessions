@@ -1,5 +1,13 @@
 import { spawn } from "node:child_process";
-import { existsSync, lstatSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import {
+  existsSync,
+  lstatSync,
+  readdirSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import os from "node:os";
 import { dirname, join, resolve, sep } from "node:path";
 import readline from "node:readline";
@@ -13,7 +21,7 @@ const ANTIGRAVITY_ID_RE =
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-async function rmWithRetry(targetPath, { recursive = false, attempts = 4 } = {}) {
+async function rmWithRetry(targetPath, { recursive = false, attempts = 6 } = {}) {
   for (let i = 0; i < attempts; i += 1) {
     if (!existsSync(targetPath)) return;
     try {
@@ -23,19 +31,22 @@ async function rmWithRetry(targetPath, { recursive = false, attempts = 4 } = {})
       const retryable = ["EBUSY", "EPERM", "ENOTEMPTY", "EACCES"].includes(err?.code);
       if (!retryable || i === attempts - 1) throw err;
     }
-    await sleep(100 * (i + 1));
+    await sleep(150 * (i + 1));
   }
+}
+
+function hasTable(db, tableName) {
+  return Boolean(
+    db
+      .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name = ?")
+      .get(tableName)
+  );
 }
 
 // T3's nativeThreadRef is the conversation identity; providerSessionId may be shared.
 export function nativeEndpoints(dbPath, ids) {
   return withDatabase(dbPath, { readOnly: true }, (db) => {
-    const table = db
-      .prepare(
-        "SELECT name FROM sqlite_master WHERE name = 'orchestration_v2_projection_provider_threads'"
-      )
-      .get();
-    if (!table) {
+    if (!hasTable(db, "orchestration_v2_projection_provider_threads")) {
       return ids.map((threadId) => ({
         threadId,
         status: "unverified",
@@ -62,20 +73,33 @@ export function nativeEndpoints(dbPath, ids) {
         .filter((r) => !r.deleted_at && !ids.includes(r.thread_id))
         .map((r) => r.thread_id)
     );
-    const parents = new Map(
-      threads.map((r) => [
-        r.thread_id,
-        parsedThreads.get(r.thread_id)?.lineage?.parentThreadId,
-      ])
-    );
+
+    const parentMap = new Map();
+    for (const r of threads) {
+      const pl = parsedThreads.get(r.thread_id) || {};
+      const p = pl.lineage?.parentThreadId || pl.delegatedFrom?.threadId || null;
+      if (p) parentMap.set(r.thread_id, p);
+    }
+    if (hasTable(db, "orchestration_v2_projection_subagents")) {
+      const subRows = db
+        .prepare(
+          "SELECT thread_id, child_thread_id FROM orchestration_v2_projection_subagents WHERE child_thread_id IS NOT NULL"
+        )
+        .all();
+      for (const s of subRows) {
+        if (s.child_thread_id && s.thread_id && !parentMap.has(s.child_thread_id)) {
+          parentMap.set(s.child_thread_id, s.thread_id);
+        }
+      }
+    }
 
     const hasRetainedDescendant = (id) =>
       [...live].some((child) => {
         const visited = new Set();
         for (
-          let parent = parents.get(child);
+          let parent = parentMap.get(child);
           parent && !visited.has(parent);
-          parent = parents.get(parent)
+          parent = parentMap.get(parent)
         ) {
           if (parent === id) return true;
           visited.add(parent);
@@ -85,8 +109,29 @@ export function nativeEndpoints(dbPath, ids) {
 
     const mapped = rows.map((r) => ({
       threadId: r.thread_id,
-      ...JSON.parse(r.payload_json),
+      ...JSON.parse(r.payload_json || "{}"),
     }));
+
+    const protectedAntigravityNativeIds = new Set(
+      mapped
+        .filter(
+          (other) =>
+            live.has(other.threadId) &&
+            (other.nativeThreadRef?.driver ?? other.driver) === "antigravity" &&
+            other.nativeThreadRef?.nativeId
+        )
+        .map((other) => other.nativeThreadRef.nativeId)
+    );
+    const protectedCodexNativeIds = new Set(
+      mapped
+        .filter(
+          (other) =>
+            live.has(other.threadId) &&
+            (other.nativeThreadRef?.driver ?? other.driver) === "codex" &&
+            other.nativeThreadRef?.nativeId
+        )
+        .map((other) => other.nativeThreadRef.nativeId)
+    );
 
     const result = [];
     for (const threadId of ids) {
@@ -130,6 +175,12 @@ export function nativeEndpoints(dbPath, ids) {
         const nativeId = r.nativeThreadRef?.nativeId;
         const endpoint = { threadId, provider, nativeId };
         if (worktreePath) endpoint.worktreePath = worktreePath;
+        if (provider === "antigravity" && protectedAntigravityNativeIds.size > 0) {
+          endpoint.protectedNativeIds = [...protectedAntigravityNativeIds];
+        }
+        if (provider === "codex" && protectedCodexNativeIds.size > 0) {
+          endpoint.protectedNativeIds = [...protectedCodexNativeIds];
+        }
 
         if (!nativeId || r.nativeThreadRef?.strength !== "strong") {
           Object.assign(endpoint, {
@@ -170,8 +221,10 @@ export function nativeEndpoints(dbPath, ids) {
   });
 }
 
-function findMatchingFilesRecursive(dirPath, needle) {
+function findMatchingFilesRecursive(dirPath, needles) {
   if (!existsSync(dirPath)) return [];
+  const needleList = Array.isArray(needles) ? needles : [needles];
+  if (needleList.length === 0) return [];
   const hits = [];
   const stack = [dirPath];
   while (stack.length > 0) {
@@ -186,7 +239,7 @@ function findMatchingFilesRecursive(dirPath, needle) {
       const full = join(current, entry.name);
       if (entry.isDirectory()) {
         stack.push(full);
-      } else if (entry.name.includes(needle)) {
+      } else if (needleList.some((n) => entry.name.includes(n))) {
         hits.push(full);
       }
     }
@@ -194,67 +247,181 @@ function findMatchingFilesRecursive(dirPath, needle) {
   return hits;
 }
 
-function hasTable(db, tableName) {
-  return Boolean(
-    db
-      .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name = ?")
-      .get(tableName)
-  );
+export function discoverCodexSqliteFiles(codexHome) {
+  if (!codexHome || !existsSync(codexHome)) return [];
+  const files = new Set();
+  for (const dir of [codexHome, join(codexHome, "sqlite")]) {
+    if (!existsSync(dir)) continue;
+    let entries = [];
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      if (!entry.isFile()) continue;
+      if (/\.(sqlite|db)$/i.test(entry.name)) {
+        files.add(join(dir, entry.name));
+      }
+    }
+  }
+  return [...files];
 }
 
-function purgeCodexLocalStorage(nativeId, codexHome) {
-  if (!codexHome || !existsSync(codexHome)) return;
-  let entries = [];
-  try {
-    entries = readdirSync(codexHome);
-  } catch {
-    return;
+export function collectCodexConversationTree(
+  initialIds,
+  codexHome,
+  protectedIds = new Set()
+) {
+  const startList = Array.isArray(initialIds) ? initialIds : [initialIds];
+  const ids = new Set(startList.filter((id) => CANONICAL_UUID_RE.test(id)));
+  const queue = [...ids];
+  const sqliteFiles = discoverCodexSqliteFiles(codexHome);
+
+  while (queue.length > 0) {
+    const currentId = queue.shift();
+    for (const sqlitePath of sqliteFiles) {
+      try {
+        withDatabase(sqlitePath, { readOnly: true }, (db) => {
+          if (!hasTable(db, "thread_spawn_edges")) return;
+          const rows = db
+            .prepare(
+              "SELECT child_thread_id FROM thread_spawn_edges WHERE parent_thread_id = ?"
+            )
+            .all(currentId);
+          for (const r of rows) {
+            const childId = r?.child_thread_id;
+            if (
+              childId &&
+              CANONICAL_UUID_RE.test(childId) &&
+              !protectedIds.has(childId) &&
+              !ids.has(childId)
+            ) {
+              ids.add(childId);
+              queue.push(childId);
+            }
+          }
+        });
+      } catch {
+        // Ignore locked/unreadable db during tree expansion; verification catches issues.
+      }
+    }
+  }
+  return [...ids];
+}
+
+const CODEX_THREAD_ID_TABLES = [
+  "logs",
+  "thread_dynamic_tools",
+  "thread_attachments",
+  "guardian_review_feedback",
+  "thread_read_receipts",
+  "thread_items",
+  "thread_turns",
+  "thread_realtime_items",
+  "thread_history_projection_state",
+  "thread_goal_continuation_deferrals",
+  "thread_goals",
+  "queued_items",
+  "queued_thread_revisions",
+  // ~/.codex/sqlite/codex.db catalog and UI tables:
+  "local_thread_catalog",
+  "thread_timeline_ledger",
+  "local_thread_catalog_scan_entries",
+  "inbox_items",
+  "automation_runs",
+  "live_visualization_suggestions",
+  "active_chat_turns",
+];
+
+function purgeCodexSessionIndex(targetIdSet, codexHome) {
+  const indexPath = join(codexHome, "session_index.jsonl");
+  if (!existsSync(indexPath)) return;
+  const raw = readFileSync(indexPath, "utf8");
+  const lines = raw.split(/\r?\n/);
+  const kept = [];
+  let changed = false;
+
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    try {
+      const parsed = JSON.parse(line);
+      const rowId = parsed?.id ?? parsed?.thread_id ?? parsed?.session_id;
+      if (rowId && targetIdSet.has(rowId)) {
+        changed = true;
+        continue;
+      }
+    } catch {
+      // Preserve unparseable lines untouched.
+    }
+    kept.push(line);
   }
 
+  if (changed) {
+    const tmpPath = `${indexPath}.${process.pid}.${Date.now()}.tmp`;
+    const output = kept.length > 0 ? `${kept.join("\n")}\n` : "";
+    writeFileSync(tmpPath, output, "utf8");
+    renameSync(tmpPath, indexPath);
+  }
+}
+
+export function purgeCodexLocalStorage(nativeIds, codexHome, { protectedIds = new Set() } = {}) {
+  if (typeof codexHome !== "string" || !codexHome || !existsSync(codexHome)) return [];
+  const allIds = collectCodexConversationTree(nativeIds, codexHome, protectedIds);
+  if (allIds.length === 0) return [];
+  const targetIdSet = new Set(allIds);
+  const sqliteFiles = discoverCodexSqliteFiles(codexHome);
   const rolloutPaths = new Set();
 
-  for (const name of entries) {
-    if (!/\.sqlite$/i.test(name)) continue;
-    const sqlitePath = join(codexHome, name);
+  for (const sqlitePath of sqliteFiles) {
     try {
       withDatabase(sqlitePath, { readOnly: false }, (db) => {
         db.exec("PRAGMA busy_timeout = 5000;");
         if (hasTable(db, "threads")) {
-          const rows = db
-            .prepare("SELECT rollout_path FROM threads WHERE id = ?")
-            .all(nativeId);
-          for (const r of rows) {
-            if (r?.rollout_path) rolloutPaths.add(r.rollout_path);
+          const stmt = db.prepare("SELECT rollout_path FROM threads WHERE id = ?");
+          for (const id of allIds) {
+            for (const r of stmt.all(id)) {
+              if (r?.rollout_path) rolloutPaths.add(r.rollout_path);
+            }
           }
         }
         db.exec("BEGIN IMMEDIATE;");
         try {
-          for (const tbl of [
-            "logs",
-            "thread_dynamic_tools",
-            "thread_attachments",
-            "guardian_review_feedback",
-            "thread_read_receipts",
-            "thread_items",
-            "thread_turns",
-            "thread_realtime_items",
-            "thread_history_projection_state",
-            "thread_goal_continuation_deferrals",
-            "thread_goals",
-            "queued_items",
-            "queued_thread_revisions",
-          ]) {
+          for (const tbl of CODEX_THREAD_ID_TABLES) {
             if (hasTable(db, tbl)) {
-              db.prepare(`DELETE FROM "${tbl}" WHERE thread_id = ?`).run(nativeId);
+              const delStmt = db.prepare(`DELETE FROM "${tbl}" WHERE thread_id = ?`);
+              for (const id of allIds) {
+                delStmt.run(id);
+              }
+            }
+          }
+          if (hasTable(db, "automations")) {
+            const cols = db
+              .prepare('PRAGMA table_info("automations")')
+              .all()
+              .map((c) => c.name);
+            if (cols.includes("target_thread_id")) {
+              const autoStmt = db.prepare(
+                'DELETE FROM "automations" WHERE target_thread_id = ?'
+              );
+              for (const id of allIds) {
+                autoStmt.run(id);
+              }
             }
           }
           if (hasTable(db, "thread_spawn_edges")) {
-            db.prepare(
+            const edgeStmt = db.prepare(
               "DELETE FROM thread_spawn_edges WHERE parent_thread_id = ? OR child_thread_id = ?"
-            ).run(nativeId, nativeId);
+            );
+            for (const id of allIds) {
+              edgeStmt.run(id, id);
+            }
           }
           if (hasTable(db, "threads")) {
-            db.prepare("DELETE FROM threads WHERE id = ?").run(nativeId);
+            const threadStmt = db.prepare("DELETE FROM threads WHERE id = ?");
+            for (const id of allIds) {
+              threadStmt.run(id);
+            }
           }
           db.exec("COMMIT;");
         } catch (err) {
@@ -267,8 +434,14 @@ function purgeCodexLocalStorage(nativeId, codexHome) {
         }
       });
     } catch {
-      // Best-effort per-db cleanup; verification step checks final state.
+      // Verification step below strictly validates zero residual rows.
     }
+  }
+
+  try {
+    purgeCodexSessionIndex(targetIdSet, codexHome);
+  } catch {
+    // Verified below
   }
 
   for (const p of rolloutPaths) {
@@ -279,8 +452,8 @@ function purgeCodexLocalStorage(nativeId, codexHome) {
     }
   }
 
-  for (const sub of ["sessions", "archived_sessions"]) {
-    const hits = findMatchingFilesRecursive(join(codexHome, sub), nativeId);
+  for (const sub of ["sessions", "archived_sessions", "thread-writer-locks"]) {
+    const hits = findMatchingFilesRecursive(join(codexHome, sub), allIds);
     for (const hit of hits) {
       try {
         rmSync(hit, { force: true });
@@ -289,40 +462,99 @@ function purgeCodexLocalStorage(nativeId, codexHome) {
       }
     }
   }
+
+  return allIds;
 }
 
-function verifyCodexLocalStorageGone(nativeId, codexHome) {
-  if (!codexHome || !existsSync(codexHome)) {
+export function verifyCodexLocalStorageGone(nativeIds, codexHome) {
+  if (typeof codexHome !== "string" || !codexHome || !existsSync(codexHome)) {
     return { gone: true };
   }
-  let entries = [];
-  try {
-    entries = readdirSync(codexHome);
-  } catch {
-    return { gone: true };
+  const idList = Array.isArray(nativeIds) ? nativeIds : [nativeIds];
+  if (idList.length === 0) return { gone: true };
+  const targetIdSet = new Set(idList);
+  const sqliteFiles = discoverCodexSqliteFiles(codexHome);
+
+  for (const sqlitePath of sqliteFiles) {
+    try {
+      const checkResult = withDatabase(sqlitePath, { readOnly: true }, (db) => {
+        if (hasTable(db, "threads")) {
+          const stmt = db.prepare("SELECT count(*) AS c FROM threads WHERE id = ?");
+          for (const id of idList) {
+            if (Number(stmt.get(id)?.c ?? 0) > 0) {
+              return {
+                gone: false,
+                detail: `Row still exists in ${sqlitePath} (threads: ${id})`,
+              };
+            }
+          }
+        }
+        if (hasTable(db, "local_thread_catalog")) {
+          const stmt = db.prepare(
+            "SELECT count(*) AS c FROM local_thread_catalog WHERE thread_id = ?"
+          );
+          for (const id of idList) {
+            if (Number(stmt.get(id)?.c ?? 0) > 0) {
+              return {
+                gone: false,
+                detail: `Row still exists in ${sqlitePath} (local_thread_catalog: ${id})`,
+              };
+            }
+          }
+        }
+        if (hasTable(db, "thread_spawn_edges")) {
+          const stmt = db.prepare(
+            "SELECT count(*) AS c FROM thread_spawn_edges WHERE parent_thread_id = ? OR child_thread_id = ?"
+          );
+          for (const id of idList) {
+            if (Number(stmt.get(id, id)?.c ?? 0) > 0) {
+              return {
+                gone: false,
+                detail: `Spawn edge still exists in ${sqlitePath} (thread_spawn_edges: ${id})`,
+              };
+            }
+          }
+        }
+        return { gone: true };
+      });
+      if (!checkResult.gone) return checkResult;
+    } catch (err) {
+      return {
+        gone: false,
+        detail: `SQLite verification error on ${sqlitePath}: ${err.message}`,
+      };
+    }
   }
 
-  for (const name of entries) {
-    if (!/^state_\d+\.sqlite$/i.test(name)) continue;
-    const sqlitePath = join(codexHome, name);
+  const indexPath = join(codexHome, "session_index.jsonl");
+  if (existsSync(indexPath)) {
     try {
-      const count = withDatabase(sqlitePath, { readOnly: true }, (db) => {
-        if (!hasTable(db, "threads")) return 0;
-        const row = db
-          .prepare("SELECT count(*) AS c FROM threads WHERE id = ?")
-          .get(nativeId);
-        return Number(row?.c ?? 0);
-      });
-      if (count > 0) {
-        return { gone: false, detail: `Row still exists in ${name}` };
+      const raw = readFileSync(indexPath, "utf8");
+      for (const line of raw.split(/\r?\n/)) {
+        if (!line.trim()) continue;
+        try {
+          const parsed = JSON.parse(line);
+          const rowId = parsed?.id ?? parsed?.thread_id ?? parsed?.session_id;
+          if (rowId && targetIdSet.has(rowId)) {
+            return {
+              gone: false,
+              detail: `Entry still exists in session_index.jsonl (${rowId})`,
+            };
+          }
+        } catch {
+          // Ignore malformed line
+        }
       }
-    } catch {
-      // Ignore transient lock while verifying; caller retries if needed.
+    } catch (err) {
+      return {
+        gone: false,
+        detail: `Failed to verify session_index.jsonl: ${err.message}`,
+      };
     }
   }
 
   for (const sub of ["sessions", "archived_sessions"]) {
-    const hits = findMatchingFilesRecursive(join(codexHome, sub), nativeId);
+    const hits = findMatchingFilesRecursive(join(codexHome, sub), idList);
     if (hits.length > 0) {
       return { gone: false, detail: `Rollout file still exists: ${hits[0]}` };
     }
@@ -340,6 +572,7 @@ export async function deleteCodex(
     homedir = os.homedir(),
     maxAttempts = 2,
     retryDelayMs = 250,
+    protectedNativeIds = [],
   } = {}
 ) {
   if (!CANONICAL_UUID_RE.test(nativeId)) {
@@ -347,6 +580,9 @@ export async function deleteCodex(
   }
 
   const codexHome = resolve(env.CODEX_HOME || join(homedir, ".codex"));
+  const protectedSet = new Set(protectedNativeIds);
+  const targetIds = collectCodexConversationTree([nativeId], codexHome, protectedSet);
+
   const resolvedCli = resolveCodexCli(command, { env, platform, homedir });
   const spec = buildCliExecSpec(resolvedCli, ["app-server", "--stdio"], {
     platform,
@@ -399,7 +635,7 @@ export async function deleteCodex(
 
   try {
     const init = await call("initialize", {
-      clientInfo: { name: "t3-session-cleanup", version: "1.8.0" },
+      clientInfo: { name: "t3-session-cleanup", version: "1.9.0" },
     });
     if (init.error) throw new Error(init.error.message);
 
@@ -408,10 +644,11 @@ export async function deleteCodex(
       includeTurns: false,
     });
     const preMsg = preRead.error?.message ?? "";
+    const preDisk = verifyCodexLocalStorageGone(targetIds, codexHome);
     if (
       preMsg.includes(nativeId) &&
       /no rollout found|not found|thread not loaded/i.test(preMsg) &&
-      verifyCodexLocalStorageGone(nativeId, codexHome).gone
+      preDisk.gone
     ) {
       return {
         status: "already_deleted",
@@ -420,36 +657,41 @@ export async function deleteCodex(
     }
 
     let lastErr = null;
-    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-      const deleted = await call("thread/delete", { threadId: nativeId });
-      if (!deleted.error) {
-        lastErr = null;
-        break;
-      }
-      const errMsg = deleted.error.message ?? "Unknown Codex delete error";
-      if (/no rollout found|not found|thread not loaded/i.test(errMsg)) {
-        lastErr = null;
-        break;
-      }
-      lastErr = errMsg;
-      if (/active writer|locked|busy/i.test(errMsg)) {
-        if (attempt < maxAttempts) {
-          await sleep(retryDelayMs);
-          continue;
+    for (const tid of targetIds) {
+      for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+        const deleted = await call("thread/delete", { threadId: tid });
+        if (!deleted.error) {
+          lastErr = null;
+          break;
         }
-        break;
+        const errMsg = deleted.error.message ?? "Unknown Codex delete error";
+        if (/no rollout found|not found|thread not loaded/i.test(errMsg)) {
+          lastErr = null;
+          break;
+        }
+        lastErr = errMsg;
+        if (/active writer|locked|busy/i.test(errMsg)) {
+          if (attempt < maxAttempts) {
+            await sleep(retryDelayMs);
+            continue;
+          }
+          break;
+        }
+        return { status: "failed", reason: errMsg };
       }
-      return { status: "failed", reason: errMsg };
     }
 
+    // Always purge local SQLite (state_*.sqlite + sqlite/codex.db), session_index.jsonl,
+    // thread_spawn_edges, and rollout files so UI catalog entries never linger.
+    purgeCodexLocalStorage(targetIds, codexHome, { protectedIds: protectedSet });
+    const diskAfterPurge = verifyCodexLocalStorageGone(targetIds, codexHome);
+
     if (lastErr && /active writer|locked|busy/i.test(lastErr)) {
-      purgeCodexLocalStorage(nativeId, codexHome);
-      const diskAfterPurge = verifyCodexLocalStorageGone(nativeId, codexHome);
       if (diskAfterPurge.gone) {
         return {
           status: "deleted",
           verification:
-            "Purged directly from local Codex SQLite and rollout dirs while app-server writer lock awaits idle eviction",
+            "Purged directly from local Codex SQLite (including codex.db), session_index.jsonl, and rollout dirs while app-server writer lock awaits idle eviction",
         };
       }
       return { status: "failed", reason: `${lastErr} (${diskAfterPurge.detail})` };
@@ -468,23 +710,17 @@ export async function deleteCodex(
       message.includes(nativeId) &&
       /no rollout found|not found|thread not loaded/i.test(message);
 
-    let diskCheck = verifyCodexLocalStorageGone(nativeId, codexHome);
-    if (!diskCheck.gone) {
-      purgeCodexLocalStorage(nativeId, codexHome);
-      diskCheck = verifyCodexLocalStorageGone(nativeId, codexHome);
-    }
-
-    if (missingRpc && diskCheck.gone) {
+    if (missingRpc && diskAfterPurge.gone) {
       return {
         status: "deleted",
-        verification: `${message}; absent from local Codex SQLite and rollout dirs`,
+        verification: `${message}; absent from local Codex SQLite (state_*.sqlite & codex.db), session_index.jsonl, and rollout dirs`,
       };
     }
     return {
       status: "unverified",
       verification: !missingRpc
         ? message || "Native conversation still readable"
-        : diskCheck.detail,
+        : diskAfterPurge.detail,
     };
   } catch (error) {
     return { status: "failed", reason: error.message };
@@ -567,7 +803,8 @@ export async function deleteClaude(
           if (hasSidecar) await rmWithRetry(sidecarDir, { recursive: true });
           if (
             isScratchWorktree(worktreePath, scratchRoot) ||
-            entry.name.includes("-t3-scratch-")
+            entry.name.includes("-t3-scratch-") ||
+            entry.name.includes("-t3-worktrees-")
           ) {
             candidateScratchProjDirs.add(projDir);
           }
@@ -651,7 +888,12 @@ function collectAntigravityAcpRoots({ dbPath, userdataDir, env, homedir }) {
   return [...roots];
 }
 
-function collectAntigravityConversationTree(initialId, acpRoots) {
+function collectAntigravityConversationTree(
+  initialId,
+  acpRoots,
+  protectedIds = new Set()
+) {
+  if (protectedIds.has(initialId)) return [];
   const ids = new Set([initialId]);
   const queue = [initialId];
 
@@ -677,7 +919,11 @@ function collectAntigravityConversationTree(initialId, acpRoots) {
           let m;
           while ((m = regex.exec(line)) !== null) {
             const subId = m[1];
-            if (ANTIGRAVITY_ID_RE.test(subId) && !ids.has(subId)) {
+            if (
+              ANTIGRAVITY_ID_RE.test(subId) &&
+              !protectedIds.has(subId) &&
+              !ids.has(subId)
+            ) {
               ids.add(subId);
               queue.push(subId);
             }
@@ -699,6 +945,7 @@ export async function deleteAntigravity(
     userdataDir = null,
     env = process.env,
     homedir = os.homedir(),
+    protectedNativeIds = [],
   } = {}
 ) {
   if (!ANTIGRAVITY_ID_RE.test(nativeId)) {
@@ -715,7 +962,12 @@ export async function deleteAntigravity(
       env,
       homedir,
     });
-    const allIds = collectAntigravityConversationTree(nativeId, acpRoots);
+    const protectedSet = new Set(protectedNativeIds);
+    const allIds = collectAntigravityConversationTree(
+      nativeId,
+      acpRoots,
+      protectedSet
+    );
     let foundAny = false;
 
     for (const root of acpRoots) {
@@ -797,14 +1049,19 @@ export async function deleteNativeEndpoints(
     }
     let result;
     if (endpoint.provider === "codex") {
-      result = await codexDelete(endpoint.nativeId);
+      result = await codexDelete(endpoint.nativeId, {
+        protectedNativeIds: endpoint.protectedNativeIds ?? [],
+      });
     } else if (["claude", "claudeAgent"].includes(endpoint.provider)) {
       result = await claudeDelete(endpoint.nativeId, {
         scratchRoot,
         worktreePath: endpoint.worktreePath ?? null,
       });
     } else if (endpoint.provider === "antigravity") {
-      result = await antigravityDelete(endpoint.nativeId, { dbPath });
+      result = await antigravityDelete(endpoint.nativeId, {
+        dbPath,
+        protectedNativeIds: endpoint.protectedNativeIds ?? [],
+      });
     } else {
       result = {
         status: "unsupported",

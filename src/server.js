@@ -1,10 +1,16 @@
-import { nativeEndpoints, deleteNativeEndpoints } from './native.js';
+import { nativeEndpoints, deleteNativeEndpoints } from "./native.js";
 import { existsSync, readFileSync } from "node:fs";
 import os from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
 import readline from "node:readline";
 import { resolveT3Cli } from "../bin/platform.js";
-import { cleanFamily, cleanOrphans, removeDeletedScratch } from "./cleaner.js";
+import {
+  buildAutoRegistryFromDb,
+  cleanFamily,
+  cleanOrphans,
+  inspectWorktreesForThreads,
+  removeDeletedScratch,
+} from "./cleaner.js";
 import { executeStep, planCleanup } from "./family.js";
 import {
   defaultCleanupStateDir,
@@ -14,7 +20,7 @@ import {
 import { normalizeDbPath, sameDbPath, withDatabase } from "./sqlite.js";
 import { dispatchT3Commands } from "./ws-rpc.js";
 
-export const SERVER_VERSION = "1.8.0";
+export const SERVER_VERSION = "1.9.0";
 
 export function toolDefinitions() {
   const common = {
@@ -64,18 +70,30 @@ export function toolDefinitions() {
     if (!isOrphans) {
       properties.thread_id = { type: "string", minLength: 1 };
       required.push("thread_id");
+      properties.remote_receipts = {
+        type: "array",
+        items: { type: "object" },
+        description:
+          "Optional verified remote cleanup receipts when this family has cross-device remoteChild delegations.",
+      };
     }
     if (isFamily) {
       properties.keep_parent = { type: "boolean", default: false };
     }
     if (!isArchiveTool) {
       properties.archive_only = { type: "boolean", default: false };
+      properties.confirm_remove_git_worktrees = {
+        type: "boolean",
+        default: false,
+        description:
+          "Set true after user confirmation to remove exclusive git-enabled scratch directories or isolated git worktrees.",
+      };
     }
     result.push({
       name,
       description: isArchiveTool
         ? "Preview by default. In online mode, stop and archive selected threads (recoverable) through T3 official commands. Offline mode requires explicit opt-in."
-        : "Preview by default. In online mode, stop and delete selected threads through T3 official commands, delete and verify underlying native conversations (Codex/ChatGPT, Claude, Antigravity), and remove exclusive T3 scratch directories while preserving shared folders and external git worktrees.",
+        : "Preview by default. In online mode, stop and delete selected threads through T3 official commands, delete and verify underlying native conversations (Codex/ChatGPT including codex.db & session_index.jsonl, Claude, Antigravity), and remove exclusive T3 scratch directories (plus git/worktree directories when confirm_remove_git_worktrees=true).",
       inputSchema: {
         type: "object",
         properties,
@@ -89,23 +107,34 @@ export function toolDefinitions() {
     ["schedule_delete_family", "delete", "/deletefamily ($deletefamily)"],
     ["schedule_archive_family", "archive", "/archivefamily ($archivefamily)"],
   ]) {
+    const props = {
+      target_host: common.target_host,
+      db_path: common.db_path,
+      thread_id: { type: "string", minLength: 1 },
+      delay_ms: {
+        type: "integer",
+        minimum: 200,
+        maximum: 30000,
+        default: 1500,
+      },
+      dry_run: { type: "boolean", default: true },
+      remote_receipts: {
+        type: "array",
+        items: { type: "object" },
+      },
+    };
+    if (schedAction === "delete") {
+      props.confirm_remove_git_worktrees = {
+        type: "boolean",
+        default: false,
+      };
+    }
     result.push({
       name: schedName,
       description: `Fast detached self-${schedAction} for ${cmdLabel}. Previews by default; when dry_run=false on a running T3 server, spawns an independent OS-detached worker that waits delay_ms and ${schedAction}s local descendants plus thread_id (keep_parent=false), writing a verified JSON receipt outside the session.`,
       inputSchema: {
         type: "object",
-        properties: {
-          target_host: common.target_host,
-          db_path: common.db_path,
-          thread_id: { type: "string", minLength: 1 },
-          delay_ms: {
-            type: "integer",
-            minimum: 200,
-            maximum: 30000,
-            default: 1500,
-          },
-          dry_run: { type: "boolean", default: true },
-        },
+        properties: props,
         required: ["target_host", "db_path", "thread_id"],
         additionalProperties: false,
       },
@@ -116,7 +145,7 @@ export function toolDefinitions() {
     {
       name: "plan_cross_device_cleanup",
       description:
-        "Plan current-thread descendants or ancestor pruning: all remote endpoints must finish before any local step. Supports action='delete' or action='archive'.",
+        "Plan current-thread descendants or ancestor pruning: all remote endpoints must finish before any local step. Automatically discovers local and remoteChild lineage from the configured T3 SQLite database when registry is omitted. Supports action='delete' or action='archive'.",
       inputSchema: {
         type: "object",
         properties: {
@@ -135,12 +164,7 @@ export function toolDefinitions() {
             default: "delete",
           },
         },
-        required: [
-          "registry",
-          "anchor_node_id",
-          "current_environment_id",
-          "current_thread_id",
-        ],
+        required: ["current_thread_id"],
       },
     },
     {
@@ -155,6 +179,7 @@ export function toolDefinitions() {
           receipts: { type: "array", items: { type: "object" } },
           worker_thread_id: { type: "string" },
           dry_run: { type: "boolean", default: true },
+          confirm_remove_git_worktrees: { type: "boolean", default: false },
         },
         required: ["plan", "node_id", "receipts", "worker_thread_id"],
       },
@@ -164,15 +189,49 @@ export function toolDefinitions() {
   result.push({
     name: "delete_native_sessions",
     description:
-      "Delete and verify native conversations (and exclusive scratch directories if the T3 thread is already deleted) mapped to one exact T3 thread. Preview by default.",
+      "Delete and verify native conversations (and exclusive scratch/worktree directories if the T3 thread is already deleted) mapped to one exact T3 thread. Preview by default.",
     inputSchema: {
       type: "object",
-      properties: { ...common, thread_id: { type: "string" } },
+      properties: {
+        ...common,
+        thread_id: { type: "string" },
+        confirm_remove_git_worktrees: { type: "boolean", default: false },
+      },
       required: ["target_host", "db_path", "thread_id"],
       additionalProperties: false,
     },
   });
   return result;
+}
+
+function areRemoteChildrenConfirmed(remoteChildren, remoteReceipts, action = "delete") {
+  if (!Array.isArray(remoteChildren) || remoteChildren.length === 0) {
+    return { confirmed: true, unconfirmed: [] };
+  }
+  const receipts = Array.isArray(remoteReceipts) ? remoteReceipts : [];
+  const okStatuses =
+    action === "archive"
+      ? new Set(["archived", "already_archived", "already_deleted", "completed"])
+      : new Set(["deleted", "already_deleted", "completed"]);
+
+  const unconfirmed = [];
+  for (const rc of remoteChildren) {
+    const matched = receipts.some(
+      (r) =>
+        r &&
+        (r.environment_id === rc.environmentId ||
+          r.environmentId === rc.environmentId ||
+          r?.target?.environment_id === rc.environmentId) &&
+        (r.thread_id === rc.threadId ||
+          r.threadId === rc.threadId ||
+          r.parentThreadId === rc.threadId) &&
+        okStatuses.has(r.status)
+    );
+    if (!matched) {
+      unconfirmed.push(rc);
+    }
+  }
+  return { confirmed: unconfirmed.length === 0, unconfirmed };
 }
 
 export async function callTool(
@@ -181,23 +240,44 @@ export async function callTool(
   config = {},
   { dispatchFn = dispatchT3Commands, spawnSelfDeleteFn = spawnDetachedSelfDelete } = {}
 ) {
-  if (name === "plan_cross_device_cleanup") {
-    return planCleanup(
-      args.registry,
-      args.anchor_node_id,
-      args.current_environment_id,
-      args.current_thread_id,
-      args.scope ?? "descendants_only",
-      args.action ?? "delete"
-    );
-  }
-
   const dbConfigPath = config.db ? normalizeDbPath(String(config.db)) : null;
   const allowOfflineWrites = Boolean(
     config.allowOfflineWrites ?? config.allow_offline_writes
   );
   const t3Url = config.t3Url ?? config.t3_url ?? null;
   const t3Cli = config.t3Cli ?? config.t3_cli ?? "t3";
+
+  if (name === "plan_cross_device_cleanup") {
+    let registry = args.registry;
+    let anchorNodeId = args.anchor_node_id;
+    let currentEnvId = args.current_environment_id;
+    const currentThreadId = args.current_thread_id;
+
+    if (!registry) {
+      if (!dbConfigPath || !currentThreadId) {
+        throw new Error(
+          "plan_cross_device_cleanup requires either an explicit registry or a configured database + current_thread_id"
+        );
+      }
+      const autoBuilt = buildAutoRegistryFromDb(
+        dbConfigPath,
+        currentThreadId,
+        currentEnvId
+      );
+      registry = autoBuilt.registry;
+      anchorNodeId = anchorNodeId || autoBuilt.anchorNodeId;
+      currentEnvId = currentEnvId || autoBuilt.currentEnvironmentId;
+    }
+
+    return planCleanup(
+      registry,
+      anchorNodeId,
+      currentEnvId,
+      currentThreadId,
+      args.scope ?? "descendants_only",
+      args.action ?? "delete"
+    );
+  }
 
   if (name === "execute_cleanup_step") {
     if (!dbConfigPath || !args?.worker_thread_id) {
@@ -214,7 +294,10 @@ export async function callTool(
       { db: dbConfigPath, t3Url, t3Cli },
       args.worker_thread_id,
       stepDryRun,
-      { dispatchFn }
+      {
+        dispatchFn,
+        confirmRemoveGitWorktrees: Boolean(args.confirm_remove_git_worktrees),
+      }
     );
   }
 
@@ -225,7 +308,7 @@ export async function callTool(
     t3_url: t3Url,
     native_files: "delete_and_verify_per_endpoint",
     scratch_directories: "remove_exclusive_after_delete",
-    worktrees: "preserved",
+    worktrees: "confirm_before_remove_git_or_worktree",
   };
 
   if (dbConfigPath) {
@@ -261,13 +344,17 @@ export async function callTool(
   }
 
   for (const [key, value] of Object.entries(args)) {
-    if (schema.properties[key].type === "boolean" && typeof value !== "boolean") {
+    const propType = schema.properties[key]?.type;
+    if (propType === "boolean" && typeof value !== "boolean") {
       throw new Error(`${key} must be a boolean`);
     }
-    if (schema.properties[key].type === "integer") {
+    if (propType === "integer") {
       if (!Number.isInteger(value) || value < 200 || value > 30000) {
         throw new Error(`${key} must be an integer between 200 and 30000`);
       }
+    }
+    if (propType === "array" && !Array.isArray(value)) {
+      throw new Error(`${key} must be an array`);
     }
   }
 
@@ -287,18 +374,31 @@ export async function callTool(
   }
 
   const dryRun = args.dry_run === undefined ? true : args.dry_run;
+  const confirmRemoveGitWorktrees = Boolean(args.confirm_remove_git_worktrees);
+
   if (name === "delete_native_sessions") {
     const endpoints = nativeEndpoints(dbConfigPath, [args.thread_id]);
-    if (dryRun) return { target, status: "preview", endpoints };
+    const wtReq = inspectWorktreesForThreads(dbConfigPath, [args.thread_id]).filter(
+      (w) => w.requiresConfirmation
+    );
+    if (dryRun) {
+      const prev = { target, status: "preview", endpoints };
+      if (wtReq.length > 0) prev.worktreeConfirmationsRequired = wtReq;
+      return prev;
+    }
     const native = await deleteNativeEndpoints(endpoints, { dbPath: dbConfigPath });
-    const scratchDirectories = removeDeletedScratch(dbConfigPath, [args.thread_id]);
+    const scratchDirectories = removeDeletedScratch(dbConfigPath, [args.thread_id], {
+      confirmRemoveGitWorktrees,
+    });
+    const scratchFailed = scratchDirectories.some((s) => s.status === "failed");
     return {
       target,
-      status: native.complete ? "completed" : "incomplete_native",
+      status: native.complete && !scratchFailed ? "completed" : "incomplete_native",
       native,
       scratchDirectories,
     };
   }
+
   if (name === "schedule_delete_family" || name === "schedule_archive_family") {
     const schedAction = name === "schedule_archive_family" ? "archive" : "delete";
     if (!t3Url) {
@@ -326,12 +426,31 @@ export async function callTool(
         receipt_dir: join(defaultCleanupStateDir(), subDir),
       };
     }
+
+    const remoteCheck = areRemoteChildrenConfirmed(
+      preview.remoteChildren,
+      args.remote_receipts,
+      schedAction
+    );
+    if (!remoteCheck.confirmed) {
+      return {
+        target,
+        ...preview,
+        status: "blocked_by_remote_descendants",
+        reason:
+          "Remote delegated descendants exist and must be verified cleaned on their owning environments before local family cleanup.",
+        pendingRemoteChildren: remoteCheck.unconfirmed,
+      };
+    }
+
     const scheduled = spawnSelfDeleteFn({
       action: schedAction,
       target_host: args.target_host,
       db_path: dbConfigPath,
       thread_id: args.thread_id,
       delay_ms: delayMs,
+      confirm_remove_git_worktrees: confirmRemoveGitWorktrees,
+      remote_receipts: args.remote_receipts ?? [],
       config: { db: dbConfigPath, t3Url, t3Cli },
     });
     return {
@@ -374,16 +493,37 @@ export async function callTool(
         action,
       });
 
+  if (!dryRun && !isOrphans && result.remoteChildren?.length > 0) {
+    const remoteCheck = areRemoteChildrenConfirmed(
+      result.remoteChildren,
+      args.remote_receipts,
+      action
+    );
+    if (!remoteCheck.confirmed) {
+      return {
+        target,
+        ...result,
+        status: "blocked_by_remote_descendants",
+        reason:
+          "Remote delegated descendants exist and must be verified cleaned on their owning environments before local cleanup.",
+        pendingRemoteChildren: remoteCheck.unconfirmed,
+      };
+    }
+  }
+
   if (t3Url && !dryRun) {
     const items = result.orphans ?? result.children ?? [];
-    const ids = items.map((r) => r.threadId);
+    const liveIds = items.map((r) => r.threadId);
     if (result.parentSelected) {
-      ids.push(args.thread_id);
+      liveIds.push(args.thread_id);
     }
+    const previouslyDeletedIds = result.previouslyDeletedChildrenIds ?? [];
+    const allCleanupIds = [...new Set([...liveIds, ...previouslyDeletedIds])];
 
-    const nativePlan = action === "delete" ? nativeEndpoints(dbConfigPath, ids) : [];
+    const nativePlan =
+      action === "delete" ? nativeEndpoints(dbConfigPath, allCleanupIds) : [];
     const commands = [];
-    for (const tid of ids) {
+    for (const tid of liveIds) {
       commands.push(
         { type: "thread.stop", threadId: tid },
         { type: `thread.${action}`, threadId: tid }
@@ -411,7 +551,7 @@ export async function callTool(
         const stmt = db.prepare(
           `SELECT ${col} AS state_val FROM orchestration_v2_projection_threads WHERE thread_id = ?`
         );
-        for (const tid of ids) {
+        for (const tid of liveIds) {
           const row = stmt.get(tid);
           if (!row || row.state_val == null) {
             throw new Error(`T3 did not confirm the requested state for ${tid}`);
@@ -425,8 +565,14 @@ export async function callTool(
       result.native = await deleteNativeEndpoints(nativePlan, {
         dbPath: dbConfigPath,
       });
-      result.scratchDirectories = removeDeletedScratch(dbConfigPath, ids);
-      result.status = result.native.complete ? "completed" : "incomplete_native";
+      result.scratchDirectories = removeDeletedScratch(dbConfigPath, allCleanupIds, {
+        confirmRemoveGitWorktrees,
+      });
+      const scratchFailed = result.scratchDirectories.some(
+        (s) => s.status === "failed"
+      );
+      result.status =
+        result.native.complete && !scratchFailed ? "completed" : "incomplete_native";
     }
     result.parentDeleted = Boolean(result.parentSelected) && action === "delete";
     result.parentArchived = Boolean(result.parentSelected) && action === "archive";
