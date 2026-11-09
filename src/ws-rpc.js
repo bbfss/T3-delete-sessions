@@ -120,7 +120,7 @@ export function createFrameReader({ onTextMessage, onPing, onClose, onError }) {
 }
 
 export function dispatchT3CommandsOverWs(
-  { url, token, commands, timeoutMs = 30000 }
+  { url, token, commands, timeoutMs = 30000, stopToDeleteSettleMs = 250 }
 ) {
   if (!commands || commands.length === 0) {
     return Promise.resolve([]);
@@ -203,6 +203,7 @@ export function dispatchT3CommandsOverWs(
       const results = [];
 
       function sendNext() {
+        if (settled || socket.destroyed) return;
         const payload = JSON.stringify({
           _tag: "Request",
           id: String(index),
@@ -240,9 +241,19 @@ export function dispatchT3CommandsOverWs(
               return;
             }
             results.push(msg.exit.value);
+            const prevType = commands[index]?.type;
             index += 1;
             if (index < commands.length) {
-              sendNext();
+              const nextType = commands[index]?.type;
+              if (
+                stopToDeleteSettleMs > 0 &&
+                prevType === "thread.stop" &&
+                (nextType === "thread.delete" || nextType === "thread.archive")
+              ) {
+                setTimeout(sendNext, stopToDeleteSettleMs);
+              } else {
+                sendNext();
+              }
             } else {
               succeed(results);
               return;

@@ -1,9 +1,10 @@
 import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { withDatabase } from "./sqlite.js";
 
 const DEFAULT_CLI_PATH = fileURLToPath(new URL("../bin/cli.js", import.meta.url));
 
@@ -133,6 +134,31 @@ export function spawnDetachedSelfDelete(
   };
 }
 
+function hasActiveProviderTurn(dbPath, threadId) {
+  if (!dbPath || !existsSync(dbPath)) return false;
+  try {
+    return withDatabase(dbPath, { readOnly: true }, (db) => {
+      const table = db
+        .prepare(
+          "SELECT name FROM sqlite_master WHERE name = 'orchestration_v2_projection_provider_threads'"
+        )
+        .get();
+      if (!table) return false;
+      const rows = db
+        .prepare(
+          "SELECT payload_json FROM orchestration_v2_projection_provider_threads WHERE thread_id = ?"
+        )
+        .all(threadId);
+      return rows.some((r) => {
+        const status = JSON.parse(r.payload_json || "{}").status;
+        return status && status !== "idle";
+      });
+    });
+  } catch {
+    return false;
+  }
+}
+
 export async function runDetachedWorker(
   jobPath,
   executeFn,
@@ -149,6 +175,10 @@ export async function runDetachedWorker(
   const delayMs = Math.max(0, Number(job.delay_ms ?? 1500));
   if (delayMs > 0) {
     await sleepFn(delayMs);
+  }
+
+  for (let i = 0; i < 25 && hasActiveProviderTurn(job.db_path, job.thread_id); i += 1) {
+    await sleepFn(300);
   }
 
   try {

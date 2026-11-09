@@ -316,7 +316,7 @@ export async function deleteCodex(
     const preMsg = preRead.error?.message ?? "";
     if (
       preMsg.includes(nativeId) &&
-      /no rollout found|not found/i.test(preMsg) &&
+      /no rollout found|not found|thread not loaded/i.test(preMsg) &&
       verifyCodexLocalStorageGone(nativeId, codexHome).gone
     ) {
       return {
@@ -333,12 +333,17 @@ export async function deleteCodex(
         break;
       }
       const errMsg = deleted.error.message ?? "Unknown Codex delete error";
-      if (/no rollout found|not found/i.test(errMsg)) {
+      if (/no rollout found|not found|thread not loaded/i.test(errMsg)) {
         lastErr = null;
         break;
       }
       lastErr = errMsg;
       if (/active writer|locked|busy/i.test(errMsg) && attempt < maxAttempts) {
+        try {
+          await call("thread/unsubscribe", { threadId: nativeId });
+        } catch {
+          // Ignore unsubscribe error on separate stdio instance.
+        }
         try {
           await call("thread/archive", { threadId: nativeId });
         } catch {
@@ -360,7 +365,8 @@ export async function deleteCodex(
     });
     const message = check.error?.message ?? "";
     const missingRpc =
-      message.includes(nativeId) && /no rollout found|not found/i.test(message);
+      message.includes(nativeId) &&
+      /no rollout found|not found|thread not loaded/i.test(message);
 
     let diskCheck = verifyCodexLocalStorageGone(nativeId, codexHome);
     for (let i = 0; !diskCheck.gone && i < 4; i += 1) {
