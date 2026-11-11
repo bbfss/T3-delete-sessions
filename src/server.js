@@ -1,26 +1,28 @@
 import { nativeEndpoints, deleteNativeEndpoints } from "./native.js";
 import { existsSync, readFileSync } from "node:fs";
 import os from "node:os";
-import { dirname, isAbsolute, join } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import readline from "node:readline";
 import { resolveT3Cli } from "../bin/platform.js";
 import {
   buildAutoRegistryFromDb,
   cleanFamily,
   cleanOrphans,
+  forceRemoveDirectorySync,
   inspectWorktreesForThreads,
   removeDeletedScratch,
 } from "./cleaner.js";
 import { executeStep, planCleanup } from "./family.js";
 import {
   defaultCleanupStateDir,
+  runDetachedScratchReaper,
   runDetachedWorker,
   spawnDetachedSelfDelete,
 } from "./self-delete.js";
 import { normalizeDbPath, sameDbPath, withDatabase } from "./sqlite.js";
 import { dispatchT3Commands } from "./ws-rpc.js";
 
-export const SERVER_VERSION = "1.9.1";
+export const SERVER_VERSION = "1.9.2";
 
 export function toolDefinitions() {
   const common = {
@@ -679,6 +681,7 @@ export function parseCliArgs(argv, { env = process.env, homedir = os.homedir() }
     call: null,
     argumentsFile: null,
     detachedWorker: null,
+    reapScratch: null,
     help: false,
   };
 
@@ -698,7 +701,8 @@ export function parseCliArgs(argv, { env = process.env, homedir = os.homedir() }
       arg === "--t3-cli" ||
       arg === "--call" ||
       arg === "--arguments-file" ||
-      arg === "--detached-worker"
+      arg === "--detached-worker" ||
+      arg === "--reap-scratch"
     ) {
       if (i + 1 >= argv.length) {
         throw new Error(`Argument ${arg} expected one value`);
@@ -711,6 +715,7 @@ export function parseCliArgs(argv, { env = process.env, homedir = os.homedir() }
       else if (arg === "--call") config.call = val;
       else if (arg === "--arguments-file") config.argumentsFile = val;
       else if (arg === "--detached-worker") config.detachedWorker = val;
+      else if (arg === "--reap-scratch") config.reapScratch = val;
     } else {
       throw new Error(`Unknown argument: ${arg}`);
     }
@@ -757,14 +762,47 @@ export async function runMain(argv = process.argv.slice(2)) {
     return;
   }
 
+  if (config.argumentsFile && config.argumentsFile !== "-") {
+    config.argumentsFile = resolve(config.argumentsFile);
+  }
+  if (config.detachedWorker) {
+    config.detachedWorker = resolve(config.detachedWorker);
+  }
+  if (config.reapScratch) {
+    config.reapScratch = resolve(config.reapScratch);
+  }
+
+  try {
+    process.chdir(os.tmpdir());
+  } catch {
+    // Best-effort release of workspace/scratch CWD handle
+  }
+
+  if (config.reapScratch) {
+    try {
+      await runDetachedScratchReaper(config.reapScratch, (dir) =>
+        forceRemoveDirectorySync(dir)
+      );
+    } catch {
+      process.exit(1);
+    }
+    return;
+  }
+
   if (config.detachedWorker) {
     try {
-      await runDetachedWorker(config.detachedWorker, (args, jobConfig, jobAction) =>
-        callTool(
-          jobAction === "archive" ? "archive_family" : "delete_family",
-          args,
-          jobConfig
-        )
+      await runDetachedWorker(
+        config.detachedWorker,
+        (args, jobConfig, jobAction) =>
+          callTool(
+            jobAction === "archive" ? "archive_family" : "delete_family",
+            args,
+            jobConfig
+          ),
+        {
+          sweepExtraScratchFn: (dbPath, ids, opts) =>
+            removeDeletedScratch(dbPath, ids, opts),
+        }
       );
     } catch {
       process.exit(1);

@@ -362,6 +362,8 @@ export async function executeStep(
   );
 
   function maybeScheduleWorkerSelfCleanup(stepResult) {
+    const stepDoneInT3 =
+      okStatuses.has(stepResult?.status) || stepResult?.status === "incomplete_native";
     if (
       dryRun ||
       !selfCleanupWorker ||
@@ -369,7 +371,7 @@ export async function executeStep(
       step.phase !== "remote" ||
       !workerThreadId ||
       explicitlyProtectedPairs.has(`${env}\0${workerThreadId}`) ||
-      !okStatuses.has(stepResult?.status)
+      !stepDoneInT3
     ) {
       return stepResult;
     }
@@ -380,9 +382,36 @@ export async function executeStep(
         s.environment_id === env &&
         s.node_id !== nodeId
     );
-    if (!otherEnvRemoteSteps.every((s) => confirmed(s.node_id))) {
-      return stepResult;
+    const unconfirmedInReceipts = otherEnvRemoteSteps.filter(
+      (s) => !confirmed(s.node_id)
+    );
+    if (unconfirmedInReceipts.length > 0) {
+      const allDoneInDb = withDatabase(dbPath, { readOnly: true }, (db) => {
+        const checkCols =
+          modeAction === "archive" ? "deleted_at, archived_at" : "deleted_at";
+        const stmt = db.prepare(
+          `SELECT ${checkCols} FROM orchestration_v2_projection_threads WHERE thread_id = ?`
+        );
+        return unconfirmedInReceipts.every((s) => {
+          const r = stmt.get(s.thread_id);
+          if (!r) return true;
+          if (modeAction === "archive") {
+            return Boolean(r.archived_at || r.deleted_at);
+          }
+          return Boolean(r.deleted_at);
+        });
+      });
+      if (!allDoneInDb) {
+        return stepResult;
+      }
     }
+
+    const envTargetThreadIds = [
+      ...new Set([
+        ...otherEnvRemoteSteps.map((s) => s.thread_id),
+        ...allStepThreadIds,
+      ]),
+    ];
 
     try {
       stepResult.workerSelfCleanup = spawnSelfDeleteFn({
@@ -393,6 +422,7 @@ export async function executeStep(
         delay_ms: delayMs,
         confirm_remove_git_worktrees: confirmRemoveGitWorktrees,
         remote_receipts: [],
+        extra_scratch_thread_ids: envTargetThreadIds,
         config: { db: dbPath, t3Url, t3Cli },
       });
     } catch (err) {

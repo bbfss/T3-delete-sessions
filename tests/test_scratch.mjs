@@ -194,3 +194,89 @@ test("SQLite auto-discovery builds remote_then_local plan and blocks single-host
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("removeDeletedScratch clears read-only files and schedules detached reaper on transient Windows EPERM lock", async () => {
+  const { chmodSync, readFileSync } = await import("node:fs");
+  const { forceRemoveDirectorySync } = await import("../src/cleaner.js");
+  const { runDetachedScratchReaper, spawnDetachedScratchReaper } = await import(
+    "../src/self-delete.js"
+  );
+
+  const root = mkdtempSync(join(tmpdir(), "t3-scratch-eperm-"));
+  try {
+    mkdirSync(join(root, "userdata"));
+    const dbPath = join(root, "userdata", "statev2.sqlite");
+    const db = new DatabaseSync(dbPath);
+    db.exec(
+      "CREATE TABLE orchestration_v2_projection_threads(thread_id TEXT,deleted_at TEXT,payload_json TEXT)"
+    );
+
+    const roDir = join(root, "scratch", "readonly-dir");
+    mkdirSync(join(roDir, ".gemini"), { recursive: true });
+    const roFile = join(roDir, ".gemini", "locked.txt");
+    writeFileSync(roFile, "readonly");
+    chmodSync(roFile, 0o444);
+
+    const epermDir = join(root, "scratch", "eperm-dir");
+    mkdirSync(epermDir, { recursive: true });
+
+    const ins = db.prepare("INSERT INTO orchestration_v2_projection_threads VALUES(?,?,?)");
+    ins.run("t-ro", "yes", JSON.stringify({ worktreePath: roDir }));
+    ins.run("t-eperm", "yes", JSON.stringify({ worktreePath: epermDir }));
+    db.close();
+
+    // 1. Read-only file inside scratch directory is cleared and removed synchronously
+    const roRes = removeDeletedScratch(dbPath, ["t-ro"]);
+    assert.equal(roRes[0].status, "removed");
+    assert.equal(existsSync(roDir), false);
+
+    // 2. Simulated transient Windows EPERM CWD lock schedules detached scratch reaper instead of failing
+    let spawnedReaperJob = null;
+    const epermRes = removeDeletedScratch(dbPath, ["t-eperm"], {
+      platform: "win32",
+      rmSyncFn: () => {
+        const err = new Error("EPERM: operation not permitted, rmdir");
+        err.code = "EPERM";
+        throw err;
+      },
+      spawnSyncFn: () => ({ status: 1 }),
+      spawnScratchReaperFn: (dirs) => {
+        const out = spawnDetachedScratchReaper(dirs, {
+          platform: "win32",
+          stateBaseDir: join(root, "state"),
+          delaysMs: [10, 20],
+          spawnSyncFn: () => ({ status: 0, stdout: "88888\r\n" }),
+          spawnFn: () => {
+            throw new Error("unexpected fallback");
+          },
+        });
+        spawnedReaperJob = out;
+        return out;
+      },
+    });
+    assert.equal(epermRes.length, 1);
+    assert.equal(epermRes[0].status, "scheduled_deferred_remove");
+    assert.equal(epermRes[0].reaperPid, 88888);
+    assert.ok(existsSync(epermDir));
+
+    // 3. When the detached reaper runs after handle closes, it removes the scratch directory and records receipt
+    let attempts = 0;
+    const reaperReceipt = await runDetachedScratchReaper(
+      spawnedReaperJob.job_path,
+      (dir) => {
+        attempts += 1;
+        if (attempts === 1) {
+          throw new Error("EPERM: still shutting down");
+        }
+        return forceRemoveDirectorySync(dir);
+      },
+      { sleepFn: async () => {} }
+    );
+    assert.equal(reaperReceipt.status, "completed");
+    assert.equal(existsSync(epermDir), false);
+    const saved = JSON.parse(readFileSync(spawnedReaperJob.receipt_path, "utf8"));
+    assert.equal(saved.status, "completed");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});

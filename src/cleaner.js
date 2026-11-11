@@ -1,7 +1,9 @@
 import { spawnSync } from "node:child_process";
-import { existsSync, rmSync, lstatSync, readFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import os from "node:os";
 import { dirname, resolve, sep, join } from "node:path";
 import { randomUUID } from "node:crypto";
+import { spawnDetachedScratchReaper } from "./self-delete.js";
 import { withDatabase, withTransaction } from "./sqlite.js";
 
 function hasTable(db, tableName) {
@@ -512,7 +514,99 @@ function checkGitDirtyStatus(directory) {
   return false;
 }
 
-function removeGitLinkedWorktree(directory) {
+function clearReadOnlyRecursive(target) {
+  try {
+    const st = lstatSync(target);
+    if (st.isSymbolicLink()) return;
+    if (st.isDirectory()) {
+      try {
+        chmodSync(target, 0o700);
+      } catch {
+        // Ignore chmod failure
+      }
+      let entries = [];
+      try {
+        entries = readdirSync(target);
+      } catch {
+        return;
+      }
+      for (const name of entries) {
+        clearReadOnlyRecursive(join(target, name));
+      }
+    } else {
+      try {
+        chmodSync(target, 0o666);
+      } catch {
+        // Ignore chmod failure
+      }
+    }
+  } catch {
+    // Ignore stat error
+  }
+}
+
+export function forceRemoveDirectorySync(
+  directory,
+  {
+    platform = process.platform,
+    rmSyncFn = rmSync,
+    spawnSyncFn = spawnSync,
+  } = {}
+) {
+  if (!existsSync(directory)) {
+    return { removed: true, error: null };
+  }
+  if (lstatSync(directory).isSymbolicLink()) {
+    return { removed: false, skippedSymlink: true, error: null };
+  }
+
+  let lastErr = null;
+  clearReadOnlyRecursive(directory);
+  try {
+    rmSyncFn(directory, {
+      recursive: true,
+      force: true,
+      maxRetries: 8,
+      retryDelay: 300,
+    });
+  } catch (err) {
+    lastErr = err?.message ?? String(err);
+  }
+
+  if (existsSync(directory) && platform === "win32") {
+    clearReadOnlyRecursive(directory);
+    try {
+      spawnSyncFn(
+        "cmd.exe",
+        [
+          "/d",
+          "/s",
+          "/c",
+          `attrib -r /s /d "${directory}\\*" >nul 2>&1 & rmdir /s /q "${directory}" >nul 2>&1`,
+        ],
+        { cwd: os.tmpdir(), windowsHide: true, timeout: 6000 }
+      );
+    } catch {
+      // Ignore cmd fallback error
+    }
+    if (existsSync(directory)) {
+      try {
+        rmSyncFn(directory, {
+          recursive: true,
+          force: true,
+          maxRetries: 3,
+          retryDelay: 250,
+        });
+      } catch (err) {
+        lastErr = err?.message ?? String(err);
+      }
+    }
+  }
+
+  return { removed: !existsSync(directory), error: lastErr };
+}
+
+function removeGitLinkedWorktree(directory, opts = {}) {
   const dotGit = join(directory, ".git");
   if (existsSync(dotGit)) {
     try {
@@ -526,22 +620,15 @@ function removeGitLinkedWorktree(directory) {
           spawnSync(
             "git",
             ["--git-dir", commonRepoGitDir, "worktree", "remove", "--force", directory],
-            { encoding: "utf8", timeout: 5000, windowsHide: true }
+            { cwd: os.tmpdir(), encoding: "utf8", timeout: 5000, windowsHide: true }
           );
         }
       }
     } catch {
-      // Fallback to rmSync below
+      // Fallback to forceRemoveDirectorySync below
     }
   }
-  if (existsSync(directory)) {
-    rmSync(directory, {
-      recursive: true,
-      force: true,
-      maxRetries: 5,
-      retryDelay: 250,
-    });
-  }
+  return forceRemoveDirectorySync(directory, opts);
 }
 
 export function inspectWorktreesForThreads(
@@ -689,7 +776,14 @@ export function inspectWorktreesForThreads(
 export function removeDeletedScratch(
   dbPath,
   ids,
-  { confirmRemoveGitWorktrees = false } = {}
+  {
+    confirmRemoveGitWorktrees = false,
+    scheduleDeferredReap = true,
+    platform = process.platform,
+    rmSyncFn = rmSync,
+    spawnSyncFn = spawnSync,
+    spawnScratchReaperFn = spawnDetachedScratchReaper,
+  } = {}
 ) {
   const t3Base = resolve(dirname(dirname(resolve(dbPath))));
   const root = resolve(t3Base, "scratch");
@@ -719,6 +813,7 @@ export function removeDeletedScratch(
     }));
     const seenDirs = new Set();
     const results = [];
+    const deferredCandidates = [];
 
     for (const row of paths.filter(
       (row) => ids.includes(row.thread_id) && row.deleted_at
@@ -779,7 +874,12 @@ export function removeDeletedScratch(
         if (existsSync(directory)) {
           if (lstatSync(directory).isSymbolicLink()) continue;
           try {
-            removeGitLinkedWorktree(directory);
+            const out = removeGitLinkedWorktree(directory, {
+              platform,
+              rmSyncFn,
+              spawnSyncFn,
+            });
+            removeErr = out?.error ?? null;
           } catch (err) {
             removeErr = err?.message ?? String(err);
           }
@@ -789,6 +889,7 @@ export function removeDeletedScratch(
           status: existsSync(directory) ? "failed" : "removed",
         };
         if (removeErr && entry.status === "failed") entry.reason = removeErr;
+        if (entry.status === "failed") deferredCandidates.push(entry);
         results.push(entry);
         continue;
       }
@@ -797,12 +898,12 @@ export function removeDeletedScratch(
       if (existsSync(directory)) {
         if (lstatSync(directory).isSymbolicLink()) continue;
         try {
-          rmSync(directory, {
-            recursive: true,
-            force: true,
-            maxRetries: 5,
-            retryDelay: 250,
+          const out = forceRemoveDirectorySync(directory, {
+            platform,
+            rmSyncFn,
+            spawnSyncFn,
           });
+          removeErr = out?.error ?? null;
         } catch (err) {
           removeErr = err?.message ?? String(err);
         }
@@ -812,8 +913,29 @@ export function removeDeletedScratch(
         status: existsSync(directory) ? "failed" : "removed",
       };
       if (removeErr && entry.status === "failed") entry.reason = removeErr;
+      if (entry.status === "failed") deferredCandidates.push(entry);
       results.push(entry);
     }
+
+    if (
+      deferredCandidates.length > 0 &&
+      scheduleDeferredReap &&
+      typeof spawnScratchReaperFn === "function"
+    ) {
+      try {
+        const reaper = spawnScratchReaperFn(deferredCandidates.map((e) => e.path));
+        if (reaper && (reaper.pid || reaper.receipt_path)) {
+          for (const entry of deferredCandidates) {
+            entry.status = "scheduled_deferred_remove";
+            entry.reaperPid = reaper.pid ?? null;
+            entry.reaperReceiptPath = reaper.receipt_path ?? null;
+          }
+        }
+      } catch {
+        // Keep status="failed" if spawning detached reaper failed
+      }
+    }
+
     return results;
   });
 }

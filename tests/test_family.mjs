@@ -380,3 +380,71 @@ test("executeStep schedules detached worker self-cleanup only after final remote
   assert.equal(step2.workerSelfCleanup.pid, 99999);
 });
 
+test("executeStep schedules worker self-cleanup via local SQLite check even when caller passes receipts=[]", async (t) => {
+  const env = makeTempEnv("win");
+  t.after(env.cleanup);
+
+  withDatabase(env.db, { readOnly: false }, (conn) => {
+    conn.exec(`
+      CREATE TABLE orchestration_v2_projection_threads(
+        thread_id TEXT,
+        title TEXT,
+        default_provider TEXT,
+        created_at TEXT,
+        archived_at TEXT,
+        deleted_at TEXT,
+        payload_json TEXT
+      );
+      CREATE TABLE orchestration_v2_projection_provider_threads(
+        thread_id TEXT,
+        payload_json TEXT
+      );
+      INSERT INTO orchestration_v2_projection_threads VALUES ('rem-a', 'RA', 'codex', 'now', NULL, NULL, '{}');
+      INSERT INTO orchestration_v2_projection_threads VALUES ('rem-b', 'RB', 'codex', 'now', NULL, NULL, '{}');
+    `);
+  });
+
+  const registry = {
+    nodes: [
+      { nodeId: "root", parentNodeId: null, t3: { environmentId: "mac", threadId: "root" } },
+      { nodeId: "ra", parentNodeId: "root", t3: { environmentId: "win", threadId: "rem-a" } },
+      { nodeId: "rb", parentNodeId: "root", t3: { environmentId: "win", threadId: "rem-b" } },
+    ],
+  };
+  const plan = planCleanup(registry, "root", "mac", "root");
+
+  const spawned = [];
+  const mockSpawnSelfDelete = (payload) => {
+    spawned.push(payload);
+    return { pid: 77777, receipt_path: "/tmp/worker-sql-self-del.json" };
+  };
+  const mockDispatch = async ({ commands }) => {
+    withDatabase(env.db, { readOnly: false }, (conn) => {
+      for (const cmd of commands) {
+        if (cmd.type === "thread.delete") {
+          conn
+            .prepare("UPDATE orchestration_v2_projection_threads SET deleted_at = 'now' WHERE thread_id = ?")
+            .run(cmd.threadId);
+        }
+      }
+    });
+  };
+
+  // Caller passes receipts=[] on BOTH steps!
+  const s1 = await executeStep(plan, "ra", [], env.config, "worker-win", false, {
+    dispatchFn: mockDispatch,
+    spawnSelfDeleteFn: mockSpawnSelfDelete,
+  });
+  assert.equal(s1.status, "deleted");
+  assert.equal(spawned.length, 0);
+
+  const s2 = await executeStep(plan, "rb", [], env.config, "worker-win", false, {
+    dispatchFn: mockDispatch,
+    spawnSelfDeleteFn: mockSpawnSelfDelete,
+  });
+  assert.equal(s2.status, "deleted");
+  assert.equal(spawned.length, 1);
+  assert.equal(spawned[0].thread_id, "worker-win");
+  assert.deepEqual(new Set(spawned[0].extra_scratch_thread_ids), new Set(["rem-a", "rem-b"]));
+});
+
