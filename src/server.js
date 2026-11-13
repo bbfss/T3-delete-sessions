@@ -22,7 +22,7 @@ import {
 import { normalizeDbPath, sameDbPath, withDatabase } from "./sqlite.js";
 import { dispatchT3Commands } from "./ws-rpc.js";
 
-export const SERVER_VERSION = "1.9.3";
+export const SERVER_VERSION = "1.9.4";
 
 export function toolDefinitions() {
   const common = {
@@ -240,17 +240,32 @@ function areRemoteChildrenConfirmed(remoteChildren, remoteReceipts, action = "de
 
   const unconfirmed = [];
   for (const rc of remoteChildren) {
-    const matched = receipts.some(
-      (r) =>
-        r &&
-        (r.environment_id === rc.environmentId ||
-          r.environmentId === rc.environmentId ||
-          r?.target?.environment_id === rc.environmentId) &&
-        (r.thread_id === rc.threadId ||
-          r.threadId === rc.threadId ||
-          r.parentThreadId === rc.threadId) &&
-        okStatuses.has(r.status)
-    );
+    const matched = receipts.some((r) => {
+      if (!r) return false;
+      const envMatch =
+        r.environment_id === rc.environmentId ||
+        r.environmentId === rc.environmentId ||
+        r?.target?.environment_id === rc.environmentId;
+      if (!envMatch || !okStatuses.has(r.status)) return false;
+
+      if (
+        r.thread_id === rc.threadId ||
+        r.threadId === rc.threadId ||
+        r.parentThreadId === rc.threadId
+      ) {
+        return true;
+      }
+
+      const wsc = r.workerSelfCleanup;
+      if (
+        wsc &&
+        (wsc.thread_id === rc.threadId || wsc.threadId === rc.threadId) &&
+        (wsc.status === "scheduled" || okStatuses.has(wsc.status))
+      ) {
+        return true;
+      }
+      return false;
+    });
     if (!matched) {
       unconfirmed.push(rc);
     }

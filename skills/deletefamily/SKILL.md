@@ -26,12 +26,12 @@ description: 显式 /deletefamily 或 $deletefamily 删除当前会话及其全�
 ## 跨设备路径（仅当当前会话存在远端 T3 后代时）
 
 1. 按相邻 [deletechilds](../deletechilds/SKILL.md) 生成并执行**后代阶段**计划：严格先远端后本地，所有远端后代均删除并核验成功后，再删除本地后代。远端离线、失败或未确认时停止后续删除，在当前会话报告阻碍并保留根以便重试，不得把部分完成报成整树已删。
-2. 全部远端后代核验完毕后，对当前根会话调用上述 `schedule_delete_family(..., remote_receipts=receipts, dry_run=false)`（内部固定 `keep_parent=false`，禁止退化为 `keep_parent=true` 或 `deletechilds`）。
+2. 全部远端后代核验完毕后，对当前根会话调用上述 `schedule_delete_family(..., remote_receipts=receipts, dry_run=false)`（`v1.9.4+` 自动识别 `receipts` 中的 `workerSelfCleanup` 放行本轮派发的远端 `cleanup_worker`，若存在早期历史已删 `remoteChild` 经 `t3_thread_list` 核实不存在后可补入 `{ environment_id, thread_id, status: "already_deleted" }`；内部固定 `keep_parent=false`，禁止退化为 `keep_parent=true` 或 `deletechilds`）。
 3. 若独立脱离进程启动失败，如实报告“后代已完成，根节点最终删除交接受阻”。只处理本次会话家族；用户主工程根目录与共享服务保留；原生聊天必须按下节删除并核验。
 
 ## 会话工作目录与原生会话物理清理（3 层全覆盖）
 
-使用 `T3-delete-sessions` 1.9.0+（100% 纯 Node.js 零外部依赖，跨 macOS / Windows / Linux 通用，无任何单机路径耦合）。所有在线删除入口在核实 T3 `deleted_at` 后自动依次执行并分别核验三层清理：
+使用 `T3-delete-sessions` 1.9.4+（100% 纯 Node.js 零外部依赖，跨 macOS / Windows / Linux 通用，无任何单机路径耦合）。所有在线删除入口在核实 T3 `deleted_at` 后自动依次执行并分别核验三层清理：
 
 1. **T3 会话层**：通过官方在线 WebSocket RPC 发送 `thread.stop` + `thread.delete`，并在 SQLite 中核验 `deleted_at` 非空（完成后立即吊销临时鉴权会话）。
 2. **原生客户端/磁盘层（不再残留在 ChatGPT 等外部客户端）**：从 T3 官方 `orchestration_v2_projection_provider_threads` 的 `nativeThreadRef` 提取真实原生会话 ID（被其他存活 T3 会话共享时自动保护为 `blocked`，未创建独立原生会话的空会话记为 `no_native_session`）：

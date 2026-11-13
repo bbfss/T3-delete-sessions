@@ -290,10 +290,32 @@ const ACTIVE_THREAD_RUN_STATUSES = new Set([
   "running",
 ]);
 
+const TERMINAL_RUN_STATUSES = new Set([
+  "completed",
+  "cancelled",
+  "interrupted",
+  "failed",
+]);
+
 function hasActiveProviderTurn(dbPath, threadId) {
   if (!dbPath || !existsSync(dbPath)) return false;
   try {
     return withDatabase(dbPath, { readOnly: true }, (db) => {
+      const runsTable = db
+        .prepare(
+          "SELECT name FROM sqlite_master WHERE name = 'orchestration_v2_projection_runs'"
+        )
+        .get();
+      if (runsTable) {
+        const activeRun = db
+          .prepare(
+            "SELECT status, completed_at FROM orchestration_v2_projection_runs WHERE thread_id = ? AND completed_at IS NULL LIMIT 5"
+          )
+          .all(threadId)
+          .some((r) => r.status && !TERMINAL_RUN_STATUSES.has(r.status));
+        if (activeRun) return true;
+      }
+
       const threadTable = db
         .prepare(
           "SELECT name FROM sqlite_master WHERE name = 'orchestration_v2_projection_threads'"
@@ -312,6 +334,7 @@ function hasActiveProviderTurn(dbPath, threadId) {
           }
         }
       }
+
       const table = db
         .prepare(
           "SELECT name FROM sqlite_master WHERE name = 'orchestration_v2_projection_provider_threads'"
@@ -325,7 +348,7 @@ function hasActiveProviderTurn(dbPath, threadId) {
         .all(threadId);
       return rows.some((r) => {
         const status = JSON.parse(r.payload_json || "{}").status;
-        return status && status !== "idle";
+        return status && status !== "idle" && status !== "not_loaded";
       });
     });
   } catch {

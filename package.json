@@ -1,6 +1,6 @@
 {
   "name": "t3-delete-sessions",
-  "version": "1.9.3",
+  "version": "1.9.4",
   "description": "Zero-dependency T3 Code Session Cascading Cleaner & Orphan Purger MCP Server",
   "type": "module",
   "engines": {

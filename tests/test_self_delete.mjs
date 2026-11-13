@@ -470,3 +470,132 @@ test("runDetachedWorker waits for orchestration_v2_projection_threads running st
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("v1.9.4 schedule_delete_family accepts workerSelfCleanup in remote_receipts so coordinator can self-delete after dispatching remote cleanup_worker", async () => {
+  const { root, db } = createSelfDeleteFixture();
+  try {
+    writeFileSync(join(root, "userdata", "environment-id"), "env-mac\n", "utf8");
+    withDatabase(db, { readOnly: false }, (conn) => {
+      conn.exec("ALTER TABLE orchestration_v2_projection_subagents ADD COLUMN payload_json TEXT;");
+      conn.exec("DELETE FROM orchestration_v2_projection_threads WHERE thread_id = 'child-1';");
+      // Coordinator root-1 spawned a remote cleanup_worker 'worker-win-1' on 'env-win'
+      conn
+        .prepare("INSERT INTO orchestration_v2_projection_subagents (thread_id, child_thread_id, payload_json) VALUES (?, NULL, ?)")
+        .run(
+          "root-1",
+          JSON.stringify({ remoteChild: { environmentId: "env-win", threadId: "worker-win-1" } })
+        );
+    });
+
+    // Without receipts -> blocked_by_remote_descendants
+    const blocked = await callTool(
+      "schedule_delete_family",
+      {
+        target_host: os.hostname(),
+        db_path: db,
+        thread_id: "root-1",
+        remote_receipts: [],
+        dry_run: false,
+      },
+      { db, t3Url: "http://127.0.0.1:3773" },
+      { spawnSelfDeleteFn: () => ({ pid: 12345, receipt_path: "/tmp/r.json" }) }
+    );
+    assert.equal(blocked.status, "blocked_by_remote_descendants");
+
+    // With step receipt from worker-win-1 cleaning orphan-win-99 (containing workerSelfCleanup for worker-win-1) -> scheduled_detached_delete!
+    const scheduled = await callTool(
+      "schedule_delete_family",
+      {
+        target_host: os.hostname(),
+        db_path: db,
+        thread_id: "root-1",
+        remote_receipts: [
+          {
+            environment_id: "env-win",
+            thread_id: "orphan-win-99",
+            status: "deleted",
+            workerSelfCleanup: {
+              status: "scheduled",
+              action: "delete",
+              thread_id: "worker-win-1",
+            },
+          },
+        ],
+        dry_run: false,
+      },
+      { db, t3Url: "http://127.0.0.1:3773" },
+      { spawnSelfDeleteFn: () => ({ pid: 12345, receipt_path: "/tmp/r.json" }) }
+    );
+    assert.equal(scheduled.status, "scheduled_detached_delete");
+    assert.equal(scheduled.pid, 12345);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("v1.9.4 runDetachedWorker waits on orchestration_v2_projection_runs active run and ignores not_loaded provider_threads", async () => {
+  const { root, db } = createSelfDeleteFixture();
+  try {
+    withDatabase(db, { readOnly: false }, (conn) => {
+      conn.exec(`
+        DELETE FROM orchestration_v2_projection_threads WHERE thread_id = 'child-1';
+        CREATE TABLE orchestration_v2_projection_runs(
+          run_id TEXT PRIMARY KEY,
+          thread_id TEXT,
+          status TEXT,
+          completed_at TEXT
+        );
+        CREATE TABLE orchestration_v2_projection_provider_threads(
+          thread_id TEXT,
+          payload_json TEXT
+        );
+      `);
+      conn
+        .prepare("INSERT INTO orchestration_v2_projection_runs VALUES ('run-1', 'root-1', 'running', NULL)")
+        .run();
+      conn
+        .prepare("INSERT INTO orchestration_v2_projection_provider_threads VALUES ('root-1', ?)")
+        .run(JSON.stringify({ status: "not_loaded" }));
+    });
+
+    const jobPath = join(root, "job-runs.json");
+    const receiptPath = join(root, "receipt-runs.json");
+    writeFileSync(
+      jobPath,
+      JSON.stringify({
+        action: "delete",
+        target_host: os.hostname(),
+        db_path: db,
+        thread_id: "root-1",
+        delay_ms: 50,
+        receipt_path: receiptPath,
+        config: { db, t3Url: "http://127.0.0.1:3773" },
+      }),
+      "utf8"
+    );
+
+    const sleeps = [];
+    const receipt = await runDetachedWorker(
+      jobPath,
+      async () => ({ status: "completed", native: { complete: true } }),
+      {
+        sleepFn: async (ms) => {
+          sleeps.push(ms);
+          if (ms === 300) {
+            withDatabase(db, { readOnly: false }, (conn) => {
+              conn.exec(
+                "UPDATE orchestration_v2_projection_runs SET status = 'completed', completed_at = 'now' WHERE run_id = 'run-1'"
+              );
+            });
+          }
+        },
+      }
+    );
+
+    assert.equal(receipt.status, "completed");
+    // Polled exactly once (300ms) for run-1 to finish, and did NOT loop 80 times on provider_threads 'not_loaded'!
+    assert.deepEqual(sleeps, [50, 300]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
