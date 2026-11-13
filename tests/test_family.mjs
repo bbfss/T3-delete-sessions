@@ -448,3 +448,56 @@ test("executeStep schedules worker self-cleanup via local SQLite check even when
   assert.deepEqual(new Set(spawned[0].extra_scratch_thread_ids), new Set(["rem-a", "rem-b"]));
 });
 
+
+test("executeStep sets default post_settle_delay_ms=4500 on remote worker self-cleanup to avoid race with parent delegate fetch", async (t) => {
+  const env = makeTempEnv("vps");
+  t.after(env.cleanup);
+
+  withDatabase(env.db, { readOnly: false }, (conn) => {
+    conn.exec(`
+      CREATE TABLE orchestration_v2_projection_threads(
+        thread_id TEXT,
+        title TEXT,
+        default_provider TEXT,
+        created_at TEXT,
+        archived_at TEXT,
+        deleted_at TEXT,
+        payload_json TEXT
+      );
+      CREATE TABLE orchestration_v2_projection_provider_threads(
+        thread_id TEXT,
+        payload_json TEXT
+      );
+      INSERT INTO orchestration_v2_projection_threads VALUES ('rem-only', 'RO', 'codex', 'now', NULL, NULL, '{}');
+    `);
+  });
+
+  const registry = {
+    nodes: [
+      { nodeId: "root", parentNodeId: null, t3: { environmentId: "mac", threadId: "root" } },
+      { nodeId: "ro", parentNodeId: "root", t3: { environmentId: "vps", threadId: "rem-only" } },
+    ],
+  };
+  const plan = planCleanup(registry, "root", "mac", "root");
+  const spawned = [];
+  const res = await executeStep(plan, "ro", [], env.config, "worker-vps", false, {
+    dispatchFn: async ({ commands }) => {
+      withDatabase(env.db, { readOnly: false }, (conn) => {
+        for (const cmd of commands) {
+          if (cmd.type === "thread.delete") {
+            conn
+              .prepare("UPDATE orchestration_v2_projection_threads SET deleted_at = 'now' WHERE thread_id = ?")
+              .run(cmd.threadId);
+          }
+        }
+      });
+    },
+    spawnSelfDeleteFn: (payload) => {
+      spawned.push(payload);
+      return { pid: 88888, receipt_path: "/tmp/worker-vps-self.json" };
+    },
+  });
+  assert.equal(res.status, "deleted");
+  assert.equal(spawned.length, 1);
+  assert.equal(spawned[0].post_settle_delay_ms, 4500);
+});

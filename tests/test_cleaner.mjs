@@ -356,3 +356,107 @@ test("delete_family defaults to keep_parent=false while cross-device remote dele
   assert.equal(famRes.parentDeleted, true);
   assert.deepEqual(f.deleted(), ["child", "grandchild", "parent"]);
 });
+
+test("v1.9.3 cross-device orphan candidates, subagent child linkage, verified inbound orphans, and remote_targets plan", async (t) => {
+  const f = createFixture();
+  t.after(f.cleanup);
+
+  writeFileSync(join(dirname(f.db), "environment-id"), "env-mac-local\n", "utf8");
+  withDatabase(f.db, { readOnly: false }, (conn) => {
+    conn.exec("ALTER TABLE orchestration_v2_projection_subagents ADD COLUMN payload_json TEXT;");
+    const ins = conn.prepare(
+      "INSERT INTO orchestration_v2_projection_threads VALUES (?, ?, 'codex', 'now', 'now', NULL, ?, ?)"
+    );
+    ins.run("coord-mac", "Coordinator", null, JSON.stringify({ lineage: { parentThreadId: null } }));
+    ins.run("deleted-parent-tr", "购买目标服务并检查土耳其地区", "2026-11-13T00:00:00Z", JSON.stringify({ lineage: { parentThreadId: null } }));
+    ins.run("local-subagent-orphan", "Local Subagent Child", null, JSON.stringify({ lineage: { parentThreadId: null } }));
+    conn
+      .prepare("INSERT INTO orchestration_v2_projection_subagents (thread_id, child_thread_id, payload_json) VALUES (?, ?, ?)")
+      .run("deleted-parent-tr", "local-subagent-orphan", "{}");
+    for (const [envId, remTid] of [
+      ["env-win-remote", "win-child-1"],
+      ["env-vps-remote", "vps-child-1"],
+    ]) {
+      conn
+        .prepare("INSERT INTO orchestration_v2_projection_subagents (thread_id, child_thread_id, payload_json) VALUES (?, NULL, ?)")
+        .run("deleted-parent-tr", JSON.stringify({ remoteChild: { environmentId: envId, threadId: remTid } }));
+    }
+    ins.run(
+      "inbound-alive-remote",
+      "Inbound Alive Remote",
+      null,
+      JSON.stringify({ delegatedFrom: { environmentId: "env-win-remote", threadId: "win-live-parent" } })
+    );
+    ins.run(
+      "inbound-dead-remote",
+      "Inbound Dead Remote",
+      null,
+      JSON.stringify({ delegatedFrom: { environmentId: "env-vps-remote", threadId: "vps-deleted-parent" } })
+    );
+    ins.run(
+      "inbound-dead-local-child",
+      "Inbound Local Child",
+      null,
+      JSON.stringify({ lineage: { parentThreadId: "inbound-dead-remote" } })
+    );
+  });
+
+  const preview = await callTool("delete_orphans", f.args, f.config);
+  assert.deepEqual(
+    preview.orphans.map((o) => o.threadId),
+    ["local-subagent-orphan"]
+  );
+  assert.equal(preview.outboundRemoteOrphanCandidates.length, 2);
+  assert.deepEqual(
+    new Set(preview.outboundRemoteOrphanCandidates.map((c) => c.threadId)),
+    new Set(["win-child-1", "vps-child-1"])
+  );
+  assert.equal(preview.inboundRemoteDelegatedCandidates.length, 2);
+  assert.ok(preview.deletedOrphanParentIds.includes("deleted-parent-tr"));
+
+  await assert.rejects(
+    () =>
+      callTool(
+        "delete_orphans",
+        { ...f.args, verified_remote_orphan_thread_ids: ["unrelated"] },
+        f.config
+      ),
+    /not an inbound remote-delegated session/
+  );
+
+  const crossPlan = await callTool(
+    "plan_cross_device_cleanup",
+    {
+      db_path: f.db,
+      current_environment_id: "env-mac-local",
+      current_thread_id: "coord-mac",
+      remote_targets: [
+        { environment_id: "env-win-remote", thread_id: "win-child-1", label: "win-1" },
+        { environment_id: "env-vps-remote", thread_id: "vps-child-1", label: "vps-1" },
+      ],
+      scope: "descendants_only",
+      action: "delete",
+    },
+    f.config
+  );
+  assert.equal(crossPlan.order, "remote_then_local");
+  assert.equal(crossPlan.steps.filter((s) => s.phase === 'remote').length, 2);
+  assert.equal(crossPlan.steps.filter((s) => s.phase === 'local').length, 0);
+
+  const execRes = await callTool(
+    "delete_orphans",
+    {
+      ...f.args,
+      verified_remote_orphan_thread_ids: ["inbound-dead-remote"],
+      dry_run: false,
+      offline_confirmed: true,
+    },
+    f.config
+  );
+  assert.equal(execRes.status, "updated_offline_database");
+  assert.deepEqual(
+    new Set(execRes.orphans.map((o) => o.threadId)),
+    new Set(["local-subagent-orphan", "inbound-dead-local-child", "inbound-dead-remote"])
+  );
+  assert.ok(!f.deleted().includes("inbound-alive-remote"));
+});

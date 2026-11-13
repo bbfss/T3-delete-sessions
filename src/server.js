@@ -22,7 +22,7 @@ import {
 import { normalizeDbPath, sameDbPath, withDatabase } from "./sqlite.js";
 import { dispatchT3Commands } from "./ws-rpc.js";
 
-export const SERVER_VERSION = "1.9.2";
+export const SERVER_VERSION = "1.9.3";
 
 export function toolDefinitions() {
   const common = {
@@ -78,6 +78,21 @@ export function toolDefinitions() {
         description:
           "Optional verified remote cleanup receipts when this family has cross-device remoteChild delegations.",
       };
+    } else {
+      properties.verified_remote_orphan_thread_ids = {
+        type: "array",
+        items: { type: "string" },
+        description:
+          "Optional local inbound remote-delegated thread IDs whose remote parent on a reachable linked environment was verified deleted.",
+      };
+      if (!isArchiveTool) {
+        properties.clean_deleted_parent_residuals = {
+          type: "boolean",
+          default: false,
+          description:
+            "Set true to also purge residual local native conversations and exclusive scratch directories left behind by right-click-deleted local parents.",
+        };
+      }
     }
     if (isFamily) {
       properties.keep_parent = { type: "boolean", default: false };
@@ -155,6 +170,12 @@ export function toolDefinitions() {
           anchor_node_id: { type: "string" },
           current_environment_id: { type: "string" },
           current_thread_id: { type: "string" },
+          remote_targets: {
+            type: "array",
+            items: { type: "object" },
+            description:
+              "Optional verified live remote orphan targets [{ environment_id, thread_id, label?, title? }] anchored under current_thread_id.",
+          },
           scope: {
             type: "string",
             enum: ["descendants_only", "preserve_current_subtree"],
@@ -265,7 +286,8 @@ export async function callTool(
       const autoBuilt = buildAutoRegistryFromDb(
         dbConfigPath,
         currentThreadId,
-        currentEnvId
+        currentEnvId,
+        { remoteTargets: args.remote_targets ?? null }
       );
       registry = autoBuilt.registry;
       anchorNodeId = anchorNodeId || autoBuilt.anchorNodeId;
@@ -488,6 +510,8 @@ export async function callTool(
     ? cleanOrphans(dbConfigPath, {
         dryRun: t3Url ? true : dryRun,
         action,
+        verifiedRemoteOrphanThreadIds:
+          args.verified_remote_orphan_thread_ids ?? [],
       })
     : cleanFamily(args.thread_id, dbConfigPath, {
         dryRun: t3Url ? true : dryRun,
@@ -523,7 +547,12 @@ export async function callTool(
     if (result.parentSelected) {
       liveIds.push(args.thread_id);
     }
-    const previouslyDeletedIds = result.previouslyDeletedChildrenIds ?? [];
+    const previouslyDeletedIds = [
+      ...(result.previouslyDeletedChildrenIds ?? []),
+      ...(isOrphans && args.clean_deleted_parent_residuals === true
+        ? (result.deletedOrphanParentIds ?? [])
+        : []),
+    ];
     const allCleanupIds = [...new Set([...liveIds, ...previouslyDeletedIds])];
 
     const nativePlan =

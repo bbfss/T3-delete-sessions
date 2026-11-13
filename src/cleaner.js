@@ -156,9 +156,47 @@ export function findRemoteDelegatedChildren(
 export function buildAutoRegistryFromDb(
   dbPath,
   anchorThreadId,
-  currentEnvironmentId
+  currentEnvironmentId,
+  { remoteTargets = null } = {}
 ) {
   const localEnv = currentEnvironmentId || readLocalEnvironmentId(dbPath) || "local";
+  if (Array.isArray(remoteTargets) && remoteTargets.length > 0) {
+    const nodes = [
+      {
+        nodeId: anchorThreadId,
+        parentNodeId: null,
+        t3: {
+          environmentId: localEnv,
+          threadId: anchorThreadId,
+        },
+      },
+    ];
+    const seenRemote = new Set();
+    for (const rt of remoteTargets) {
+      const env = rt?.environment_id ?? rt?.environmentId;
+      const tid = rt?.thread_id ?? rt?.threadId;
+      if (!env || !tid || env === localEnv) continue;
+      const key = `${env}\0${tid}`;
+      if (seenRemote.has(key)) continue;
+      seenRemote.add(key);
+      nodes.push({
+        nodeId: `remote:${env}:${tid}`,
+        parentNodeId: anchorThreadId,
+        label: rt?.label ?? null,
+        title: rt?.title ?? null,
+        t3: {
+          environmentId: env,
+          threadId: tid,
+        },
+      });
+    }
+    return {
+      anchorNodeId: anchorThreadId,
+      currentEnvironmentId: localEnv,
+      registry: { nodes },
+    };
+  }
+
   return withDatabase(dbPath, { readOnly: true }, (db) => {
     const allThreads = db
       .prepare(
@@ -166,7 +204,17 @@ export function buildAutoRegistryFromDb(
       )
       .all();
     const byId = new Map(allThreads.map((r) => [r.thread_id, r]));
-    if (!byId.has(anchorThreadId)) {
+    const hasSubagentAnchor =
+      !byId.has(anchorThreadId) &&
+      hasTable(db, "orchestration_v2_projection_subagents") &&
+      Boolean(
+        db
+          .prepare(
+            "SELECT 1 FROM orchestration_v2_projection_subagents WHERE thread_id = ? LIMIT 1"
+          )
+          .get(anchorThreadId)
+      );
+    if (!byId.has(anchorThreadId) && !hasSubagentAnchor) {
       throw new Error(`Session ${anchorThreadId} not found in database.`);
     }
 
@@ -261,6 +309,10 @@ export function buildAutoRegistryFromDb(
 }
 
 export function scanOrphanSessions(db, { localEnvironmentId = null } = {}) {
+  const hasSubagents = hasTable(db, "orchestration_v2_projection_subagents");
+  const subagentParentExpr = hasSubagents
+    ? `(SELECT s.thread_id FROM orchestration_v2_projection_subagents s WHERE s.child_thread_id = orchestration_v2_projection_threads.thread_id LIMIT 1)`
+    : "NULL";
   const rows = db
     .prepare(`
       WITH all_threads AS (
@@ -276,24 +328,118 @@ export function scanOrphanSessions(db, { localEnvironmentId = null } = {}) {
                 THEN json_extract(payload_json, '$.delegatedFrom.threadId')
                 ELSE NULL
               END as local_delegated_parent_id,
+              ${subagentParentExpr} as subagent_parent_id,
               json_extract(payload_json, '$.worktreePath') as worktree_path,
               payload_json
           FROM orchestration_v2_projection_threads
       )
       SELECT
-          t.thread_id, t.title, t.default_provider,
-          COALESCE(t.parent_id, t.local_delegated_parent_id) as parent_id,
+          t.thread_id, t.title, t.default_provider, t.archived_at,
+          COALESCE(t.parent_id, t.local_delegated_parent_id, t.subagent_parent_id) as parent_id,
           p.title as parent_title, p.deleted_at as parent_deleted_at,
           t.worktree_path, t.payload_json
       FROM all_threads t
-      LEFT JOIN all_threads p ON p.thread_id = COALESCE(t.parent_id, t.local_delegated_parent_id)
-      WHERE (t.parent_id IS NOT NULL OR t.local_delegated_parent_id IS NOT NULL)
+      LEFT JOIN all_threads p ON p.thread_id = COALESCE(t.parent_id, t.local_delegated_parent_id, t.subagent_parent_id)
+      WHERE COALESCE(t.parent_id, t.local_delegated_parent_id, t.subagent_parent_id) IS NOT NULL
         AND t.deleted_at IS NULL
         AND (p.thread_id IS NULL OR p.deleted_at IS NOT NULL)
       ORDER BY t.created_at DESC
     `)
     .all(localEnvironmentId, localEnvironmentId);
   return rows.map((row) => ({ ...row }));
+}
+
+export function scanCrossDeviceOrphanCandidates(
+  db,
+  { localEnvironmentId = null, action = "delete", localOrphanIds = [] } = {}
+) {
+  const outboundRemoteOrphanCandidates = [];
+  if (
+    hasTable(db, "orchestration_v2_projection_subagents") &&
+    hasColumn(db, "orchestration_v2_projection_subagents", "payload_json")
+  ) {
+    const localOrphanSet = new Set(localOrphanIds);
+    const subRows = db
+      .prepare(`
+        SELECT s.thread_id AS parent_thread_id, p.title AS parent_title,
+               p.deleted_at AS parent_deleted_at, s.payload_json
+        FROM orchestration_v2_projection_subagents s
+        LEFT JOIN orchestration_v2_projection_threads p ON p.thread_id = s.thread_id
+        WHERE p.thread_id IS NULL OR p.deleted_at IS NOT NULL OR s.thread_id IN (
+          SELECT value FROM json_each(?)
+        )
+      `)
+      .all(JSON.stringify([...localOrphanSet]));
+
+    const seenOutbound = new Set();
+    for (const r of subRows) {
+      let payload;
+      try {
+        payload = JSON.parse(r.payload_json || "{}");
+      } catch {
+        continue;
+      }
+      const rc = payload?.remoteChild;
+      if (!rc || !rc.environmentId || !rc.threadId) continue;
+      if (localEnvironmentId && rc.environmentId === localEnvironmentId) continue;
+      const key = `${rc.environmentId}\0${rc.threadId}`;
+      if (seenOutbound.has(key)) continue;
+      seenOutbound.add(key);
+      outboundRemoteOrphanCandidates.push({
+        parentThreadId: r.parent_thread_id,
+        parentTitle: r.parent_title ?? null,
+        parentDeletedAt: r.parent_deleted_at ?? null,
+        subagentId: payload.id ?? null,
+        environmentId: rc.environmentId,
+        threadId: rc.threadId,
+        label: rc.label ?? null,
+        title: rc.title ?? payload.title ?? null,
+        status: payload.status ?? null,
+      });
+    }
+  }
+
+  const threadCols = new Set(
+    db
+      .prepare('PRAGMA table_info("orchestration_v2_projection_threads")')
+      .all()
+      .map((c) => c.name)
+  );
+  const archiveClause =
+    action === "archive" && threadCols.has("archived_at")
+      ? "AND archived_at IS NULL"
+      : "";
+
+  const inboundRows = db
+    .prepare(`
+      SELECT
+          thread_id,
+          title,
+          json_extract(payload_json, '$.delegatedFrom.environmentId') AS remote_env_id,
+          json_extract(payload_json, '$.delegatedFrom.threadId') AS remote_parent_id,
+          json_extract(payload_json, '$.delegatedFrom.title') AS remote_parent_title
+      FROM orchestration_v2_projection_threads
+      WHERE deleted_at IS NULL
+        ${archiveClause}
+        AND json_extract(payload_json, '$.delegatedFrom.threadId') IS NOT NULL
+        AND json_extract(payload_json, '$.delegatedFrom.environmentId') IS NOT NULL
+        AND (? IS NULL OR json_extract(payload_json, '$.delegatedFrom.environmentId') != ?)
+      ORDER BY created_at DESC
+    `)
+    .all(localEnvironmentId, localEnvironmentId);
+
+  const inboundRemoteDelegatedCandidates = inboundRows.map((r) => ({
+    threadId: r.thread_id,
+    title: r.title ?? null,
+    remoteEnvironmentId: r.remote_env_id,
+    remoteParentThreadId: r.remote_parent_id,
+    remoteParentTitle: r.remote_parent_title ?? null,
+  }));
+
+  return {
+    outboundRemoteOrphanCandidates,
+    inboundRemoteDelegatedCandidates,
+  };
 }
 
 export function markThreadDeleted(
@@ -358,25 +504,99 @@ export function markThreadDeleted(
   ).run(eventId, threadId, nextStreamVersion, eventType, nowIso, commandId, updatedPayloadStr);
 }
 
-export function cleanOrphans(dbPath, { dryRun = true, action = "delete" } = {}) {
+export function cleanOrphans(
+  dbPath,
+  {
+    dryRun = true,
+    action = "delete",
+    verifiedRemoteOrphanThreadIds = [],
+  } = {}
+) {
   const localEnvironmentId = readLocalEnvironmentId(dbPath);
   return withDatabase(dbPath, { readOnly: dryRun }, (db) => {
     const roots = scanOrphanSessions(db, { localEnvironmentId });
+    const extraRoots = [];
+    if (
+      Array.isArray(verifiedRemoteOrphanThreadIds) &&
+      verifiedRemoteOrphanThreadIds.length > 0
+    ) {
+      const fetchVerifiedStmt = db.prepare(`
+        SELECT thread_id, title, default_provider, archived_at, deleted_at, payload_json
+        FROM orchestration_v2_projection_threads
+        WHERE thread_id = ?
+      `);
+      for (const rawId of verifiedRemoteOrphanThreadIds) {
+        const tid = String(rawId || "").trim();
+        if (!tid) continue;
+        const row = fetchVerifiedStmt.get(tid);
+        if (!row || row.deleted_at != null) continue;
+        const pl = JSON.parse(row.payload_json || "{}");
+        const remEnv = pl?.delegatedFrom?.environmentId;
+        const remParent = pl?.delegatedFrom?.threadId;
+        if (!remEnv || !remParent || (localEnvironmentId && remEnv === localEnvironmentId)) {
+          throw new Error(
+            `Thread ${tid} is not an inbound remote-delegated session and cannot be passed in verified_remote_orphan_thread_ids`
+          );
+        }
+        extraRoots.push(row);
+      }
+    }
+
     const orphans = [];
     const seen = new Set();
-    for (const root of roots) {
+    for (const root of [...roots, ...extraRoots]) {
       for (const row of [
         ...findDescendantTree(db, root.thread_id, { localEnvironmentId }),
         root,
       ]) {
+        if (action === "archive" && row.archived_at != null) {
+          continue;
+        }
         if (!seen.has(row.thread_id)) {
           seen.add(row.thread_id);
           orphans.push(row);
         }
       }
     }
+
+    const verifiedInboundSet = new Set(extraRoots.map((r) => r.thread_id));
+    const {
+      outboundRemoteOrphanCandidates,
+      inboundRemoteDelegatedCandidates: rawInboundCandidates,
+    } = scanCrossDeviceOrphanCandidates(db, {
+      localEnvironmentId,
+      action,
+      localOrphanIds: orphans.map((o) => o.thread_id),
+    });
+    const inboundRemoteDelegatedCandidates = rawInboundCandidates.filter(
+      (c) => !verifiedInboundSet.has(c.threadId)
+    );
+
+    const candidateDeletedParents = new Set();
+    for (const r of roots) {
+      if (r.parent_id && r.parent_deleted_at != null) {
+        candidateDeletedParents.add(r.parent_id);
+      }
+    }
+    for (const out of outboundRemoteOrphanCandidates) {
+      if (out.parentThreadId && out.parentDeletedAt != null) {
+        candidateDeletedParents.add(out.parentThreadId);
+      }
+    }
+    const deletedOrphanParentIds = [...candidateDeletedParents];
+
+    const extraMeta = {
+      ...(outboundRemoteOrphanCandidates.length > 0
+        ? { outboundRemoteOrphanCandidates }
+        : {}),
+      ...(inboundRemoteDelegatedCandidates.length > 0
+        ? { inboundRemoteDelegatedCandidates }
+        : {}),
+      ...(deletedOrphanParentIds.length > 0 ? { deletedOrphanParentIds } : {}),
+    };
+
     if (orphans.length === 0) {
-      return { status: "clean", count: 0, orphans: [] };
+      return { status: "clean", count: 0, orphans: [], ...extraMeta };
     }
 
     const results = [];
@@ -393,10 +613,22 @@ export function cleanOrphans(dbPath, { dryRun = true, action = "delete" } = {}) 
       }
     }
 
+    let worktreeConfirmationsRequired = [];
+    if (dryRun && action === "delete") {
+      worktreeConfirmationsRequired = inspectWorktreesForThreads(
+        dbPath,
+        orphans.map((o) => o.thread_id)
+      ).filter((w) => w.requiresConfirmation);
+    }
+
     return {
       status: dryRun ? "preview" : "updated_offline_database",
       count: results.length,
       orphans: results,
+      ...extraMeta,
+      ...(worktreeConfirmationsRequired.length > 0
+        ? { worktreeConfirmationsRequired }
+        : {}),
     };
   });
 }

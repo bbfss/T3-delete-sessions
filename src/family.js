@@ -190,6 +190,7 @@ export async function executeStep(
     confirmRemoveGitWorktrees = false,
     selfCleanupWorker = true,
     delayMs = 2500,
+    postSettleDelayMs = 4500,
     spawnSelfDeleteFn = spawnDetachedSelfDelete,
   } = {}
 ) {
@@ -420,6 +421,7 @@ export async function executeStep(
         db_path: dbPath,
         thread_id: workerThreadId,
         delay_ms: delayMs,
+        post_settle_delay_ms: postSettleDelayMs,
         confirm_remove_git_worktrees: confirmRemoveGitWorktrees,
         remote_receipts: [],
         extra_scratch_thread_ids: envTargetThreadIds,

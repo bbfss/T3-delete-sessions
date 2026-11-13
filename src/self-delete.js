@@ -114,11 +114,13 @@ export function spawnDetachedSelfDelete(
   const jobPath = join(dir, `job-${hash}-${stamp}.json`);
 
   const delayMs = payload.delay_ms ?? 1500;
+  const postSettleDelayMs = Math.max(0, Number(payload.post_settle_delay_ms ?? 0));
   const initialReceipt = {
     status: "scheduled",
     action,
     scheduledAt: new Date(stamp).toISOString(),
     delayMs,
+    ...(postSettleDelayMs > 0 ? { postSettleDelayMs } : {}),
     target_host: payload.target_host,
     db_path: payload.db_path,
     thread_id: payload.thread_id,
@@ -129,6 +131,7 @@ export function spawnDetachedSelfDelete(
     ...payload,
     action,
     delay_ms: delayMs,
+    ...(postSettleDelayMs > 0 ? { post_settle_delay_ms: postSettleDelayMs } : {}),
     receipt_path: receiptPath,
   });
 
@@ -280,10 +283,35 @@ export async function runDetachedScratchReaper(
   return receipt;
 }
 
+const ACTIVE_THREAD_RUN_STATUSES = new Set([
+  "preparing",
+  "queued",
+  "starting",
+  "running",
+]);
+
 function hasActiveProviderTurn(dbPath, threadId) {
   if (!dbPath || !existsSync(dbPath)) return false;
   try {
     return withDatabase(dbPath, { readOnly: true }, (db) => {
+      const threadTable = db
+        .prepare(
+          "SELECT name FROM sqlite_master WHERE name = 'orchestration_v2_projection_threads'"
+        )
+        .get();
+      if (threadTable) {
+        const trow = db
+          .prepare(
+            "SELECT payload_json FROM orchestration_v2_projection_threads WHERE thread_id = ?"
+          )
+          .get(threadId);
+        if (trow?.payload_json) {
+          const tStatus = JSON.parse(trow.payload_json || "{}").status;
+          if (tStatus && ACTIVE_THREAD_RUN_STATUSES.has(tStatus)) {
+            return true;
+          }
+        }
+      }
       const table = db
         .prepare(
           "SELECT name FROM sqlite_master WHERE name = 'orchestration_v2_projection_provider_threads'"
@@ -331,8 +359,12 @@ export async function runDetachedWorker(
     await sleepFn(delayMs);
   }
 
-  for (let i = 0; i < 25 && hasActiveProviderTurn(job.db_path, job.thread_id); i += 1) {
+  for (let i = 0; i < 80 && hasActiveProviderTurn(job.db_path, job.thread_id); i += 1) {
     await sleepFn(300);
+  }
+  const postSettleDelayMs = Math.max(0, Number(job.post_settle_delay_ms ?? 0));
+  if (postSettleDelayMs > 0) {
+    await sleepFn(postSettleDelayMs);
   }
 
   try {

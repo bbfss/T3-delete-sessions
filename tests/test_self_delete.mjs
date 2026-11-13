@@ -375,3 +375,98 @@ for (const tool of ["delete_family", "delete_subsessions", "delete_orphans", "ar
     }
   });
 }
+
+test("delete_orphans with clean_deleted_parent_residuals=true purges scratch of right-click-deleted parent even with 0 live local orphans", async () => {
+  const { root, db } = createSelfDeleteFixture();
+  try {
+    withDatabase(db, { readOnly: false }, (conn) => {
+      conn.exec(`
+        ALTER TABLE orchestration_v2_projection_subagents ADD COLUMN payload_json TEXT;
+        CREATE TABLE orchestration_v2_projection_provider_threads(
+          thread_id TEXT,
+          payload_json TEXT
+        );
+        DELETE FROM orchestration_v2_projection_threads WHERE thread_id = 'child-1';
+      `);
+      const rootScratch = join(root, "scratch", "root-1");
+      mkdirSync(join(rootScratch, ".agents"), { recursive: true });
+      conn
+        .prepare(
+          "UPDATE orchestration_v2_projection_threads SET deleted_at='before', payload_json = json_set(payload_json, '$.worktreePath', ?) WHERE thread_id = 'root-1'"
+        )
+        .run(rootScratch);
+      conn
+        .prepare("INSERT INTO orchestration_v2_projection_subagents (thread_id, child_thread_id, payload_json) VALUES (?, NULL, ?)")
+        .run("root-1", JSON.stringify({ remoteChild: { environmentId: "env-win", threadId: "win-c1" } }));
+    });
+
+    const res = await callTool(
+      "delete_orphans",
+      {
+        target_host: os.hostname(),
+        db_path: db,
+        clean_deleted_parent_residuals: true,
+        dry_run: false,
+      },
+      { db, t3Url: "http://localhost:3773" },
+      { dispatchFn: async () => {} }
+    );
+    assert.equal(res.status, "completed");
+    assert.equal(res.count, 0);
+    assert.equal(existsSync(join(root, "scratch", "root-1")), false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("runDetachedWorker waits for orchestration_v2_projection_threads running status and post_settle_delay_ms", async () => {
+  const { root, db } = createSelfDeleteFixture();
+  try {
+    withDatabase(db, { readOnly: false }, (conn) => {
+      conn.exec("DELETE FROM orchestration_v2_projection_threads WHERE thread_id = 'child-1';");
+      conn
+        .prepare("UPDATE orchestration_v2_projection_threads SET payload_json = ? WHERE thread_id = 'root-1'")
+        .run(JSON.stringify({ status: "running", lineage: { parentThreadId: null } }));
+    });
+
+    const jobPath = join(root, "job-settle.json");
+    const receiptPath = join(root, "receipt-settle.json");
+    writeFileSync(
+      jobPath,
+      JSON.stringify({
+        action: "delete",
+        target_host: os.hostname(),
+        db_path: db,
+        thread_id: "root-1",
+        delay_ms: 100,
+        post_settle_delay_ms: 4500,
+        receipt_path: receiptPath,
+        config: { db, t3Url: "http://127.0.0.1:3773" },
+      }),
+      "utf8"
+    );
+
+    const sleeps = [];
+    const receipt = await runDetachedWorker(
+      jobPath,
+      async () => ({ status: "completed", native: { complete: true } }),
+      {
+        sleepFn: async (ms) => {
+          sleeps.push(ms);
+          if (ms === 300) {
+            withDatabase(db, { readOnly: false }, (conn) => {
+              conn
+                .prepare("UPDATE orchestration_v2_projection_threads SET payload_json = ? WHERE thread_id = 'root-1'")
+                .run(JSON.stringify({ status: "ready", lineage: { parentThreadId: null } }));
+            });
+          }
+        },
+      }
+    );
+
+    assert.equal(receipt.status, "completed");
+    assert.deepEqual(sleeps, [100, 300, 4500]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
